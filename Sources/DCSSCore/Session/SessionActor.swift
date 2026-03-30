@@ -19,6 +19,7 @@ public struct SessionDiagnostics: Equatable, Sendable {
 /// Primary implementation is `RustSessionClient` from `DCSSCoreFFI` (FFI) — `SessionActor`
 /// remains here to support builds where the Rust dynamic library is not present.
 public actor SessionActor: SessionClient {
+    private static let logPrefix = "[SessionActor]"
     private let transport: WebSocketTransporting
     private let codec: ProtocolCodec
     private let reconnectPolicy: ReconnectPolicy
@@ -46,6 +47,7 @@ public actor SessionActor: SessionClient {
     }
 
     public func connect(url: URL, clientVersion: String? = nil) async {
+        print("\(Self.logPrefix) connect start url=\(url.absoluteString)")
         endpoint = url
         connectionState = .connecting
         diagnostics.lastError = nil
@@ -57,14 +59,17 @@ public actor SessionActor: SessionClient {
             connectionState = .connected
             diagnostics.lastConnectedAt = Date()
             diagnostics.reconnectAttempt = nil
+            print("\(Self.logPrefix) connect success clientVersion=\(resolvedClientVersion)")
             startReceiveLoop()
         } catch {
+            print("\(Self.logPrefix) connect failed error=\(error.localizedDescription)")
             connectionState = .failed(reason: error.localizedDescription)
             diagnostics.lastError = error.localizedDescription
         }
     }
 
     public func disconnect() async {
+        print("\(Self.logPrefix) disconnect")
         receiveTask?.cancel()
         receiveTask = nil
         await transport.disconnect()
@@ -155,6 +160,7 @@ public actor SessionActor: SessionClient {
 
     private func attemptReconnect(reason: String) async {
         guard let endpoint, !isInBackground else {
+            print("\(Self.logPrefix) reconnect skipped reason=\(reason)")
             connectionState = .failed(reason: reason)
             diagnostics.lastError = reason
             return
@@ -164,6 +170,7 @@ public actor SessionActor: SessionClient {
             diagnostics.reconnectAttempt = attempt
             connectionState = .reconnecting(attempt: attempt)
             let delaySeconds = reconnectPolicy.delay(for: attempt)
+            print("\(Self.logPrefix) reconnect attempt=\(attempt) delay=\(delaySeconds)s reason=\(reason)")
             try? await Task.sleep(for: .seconds(delaySeconds))
 
             do {
@@ -171,14 +178,17 @@ public actor SessionActor: SessionClient {
                 connectionState = .connected
                 diagnostics.lastConnectedAt = Date()
                 diagnostics.reconnectAttempt = nil
+                print("\(Self.logPrefix) reconnect success attempt=\(attempt)")
                 startReceiveLoop()
                 return
             } catch {
+                print("\(Self.logPrefix) reconnect failed attempt=\(attempt) error=\(error.localizedDescription)")
                 diagnostics.lastError = error.localizedDescription
                 continue
             }
         }
 
+        print("\(Self.logPrefix) reconnect exhausted reason=\(reason)")
         connectionState = .failed(reason: reason)
         diagnostics.lastError = reason
     }

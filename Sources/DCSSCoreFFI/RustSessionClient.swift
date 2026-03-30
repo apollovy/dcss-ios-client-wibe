@@ -126,6 +126,7 @@ public enum RustSnapshotMapper {
 }
 
 public actor RustSessionClient: SessionClient {
+    private static let logPrefix = "[RustSessionClient]"
     private let handle: DCSSSessionHandle
 
     public static func makeOrNil() -> RustSessionClient? {
@@ -143,6 +144,7 @@ public actor RustSessionClient: SessionClient {
 
     public func connect(url: URL, clientVersion: String?) async {
         let urlStr = url.absoluteString
+        print("\(Self.logPrefix) connect start url=\(urlStr) clientVersion=\(clientVersion ?? "nil")")
         urlStr.withCString { urlC in
             if let clientVersion {
                 clientVersion.withCString { clientC in
@@ -152,13 +154,16 @@ public actor RustSessionClient: SessionClient {
                 dcss_session_connect(handle.raw, urlC, nil)
             }
         }
+        print("\(Self.logPrefix) connect called")
     }
 
     public func disconnect() async {
+        print("\(Self.logPrefix) disconnect")
         dcss_session_disconnect(handle.raw)
     }
 
     public func sendInput(_ command: String) async {
+        print("\(Self.logPrefix) send input=\(command)")
         command.withCString { c in
             dcss_session_send_input(handle.raw, c)
         }
@@ -179,13 +184,16 @@ public actor RustSessionClient: SessionClient {
     public func stateSnapshot() async -> (DCSSConnectionState, GameState, SessionDiagnostics) {
         let snapshotPtr = dcss_session_get_snapshot_json(handle.raw)
         guard let snapshotPtr else {
+            print("\(Self.logPrefix) snapshot unavailable")
             let conn: DCSSConnectionState = .failed(reason: "core snapshot unavailable")
             return (conn, GameState(), SessionDiagnostics(lastEventType: nil, reconnectAttempt: nil, lastError: "core missing", lastConnectedAt: nil))
         }
 
         let json = String(cString: snapshotPtr)
         dcss_free_string(snapshotPtr)
-        return RustSnapshotMapper.mapSnapshotJSON(json)
+        let snapshot = RustSnapshotMapper.mapSnapshotJSON(json)
+        print("\(Self.logPrefix) decoded snapshot state=\(String(describing: snapshot.0)) lastEvent=\(snapshot.2.lastEventType ?? "-") lastError=\(snapshot.2.lastError ?? "-")")
+        return snapshot
     }
 }
 

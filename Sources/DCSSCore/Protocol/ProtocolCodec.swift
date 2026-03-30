@@ -14,6 +14,7 @@ public enum ProtocolCodecError: Error, Equatable {
 public struct ProtocolCodec: Sendable {
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
+    private static let logPrefix = "[ProtocolCodec]"
 
     public init() {}
 
@@ -36,14 +37,18 @@ public struct ProtocolCodec: Sendable {
         }
 
         if let envelope = try? decoder.decode(DCSSWireEnvelope.self, from: data) {
-            return try decodeByType(type: envelope.type, payload: envelope.payload)
+            let event = try decodeByType(type: envelope.type, payload: envelope.payload)
+            print("\(Self.logPrefix) decoded envelope type=\(envelope.type) event=\(String(describing: event))")
+            return event
         }
 
         // Compatibility mode for endpoints with flattened event payloads.
         if let raw = try JSONSerialization.jsonObject(with: Data(string.utf8)) as? [String: Any] {
             let type = (raw["type"] as? String) ?? (raw["msg"] as? String) ?? "unknown"
             let payload = jsonToValueMap(raw)
-            return try decodeByType(type: type, payload: payload)
+            let event = try decodeByType(type: type, payload: payload)
+            print("\(Self.logPrefix) decoded flattened type=\(type) event=\(String(describing: event))")
+            return event
         }
 
         throw ProtocolCodecError.malformedPayload("Cannot decode message")

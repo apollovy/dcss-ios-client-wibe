@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -12,10 +12,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::connect_async;
+
+static RUSTLS_PROVIDER_INIT: Once = Once::new();
+
+fn ensure_rustls_crypto_provider() {
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 // ===== Protocol layer (compatible with the current Swift MVP) =====
 
@@ -382,21 +390,26 @@ async fn run_event_loop(
     state: Arc<Mutex<SessionStateInternal>>,
     mut cmd_rx: mpsc::Receiver<Command>,
 ) {
+    println!("[RustCore] event loop started");
     loop {
         // Wait for a ConnectNow command or for outgoing commands while idle.
         match cmd_rx.recv().await {
             Some(Command::ConnectNow) => {
+                println!("[RustCore] ConnectNow received");
                 // Attempt connect loop until disconnect/background.
                 if state.lock().unwrap().is_in_background {
+                    println!("[RustCore] skip connect: app in background");
                     continue;
                 }
 
                 let endpoint = state.lock().unwrap().endpoint.clone();
                 let client_version = state.lock().unwrap().client_version.clone();
                 if endpoint.is_none() {
+                    println!("[RustCore] skip connect: endpoint missing");
                     continue;
                 }
                 let endpoint = endpoint.unwrap();
+                println!("[RustCore] connect target={endpoint}");
 
                 let mut attempt: u32 = 0;
                 let max_attempts: u32 = 5;
@@ -424,12 +437,29 @@ async fn run_event_loop(
                         s.diagnostics.last_error = None;
                     }
 
-                    let ws_res = connect_async(endpoint.clone()).await;
-                    let (mut ws_stream, _) = match ws_res {
+                    println!("[RustCore] connect attempt={attempt} start");
+                    let ws_res = timeout(Duration::from_secs(20), connect_async(endpoint.clone())).await;
+                    let ws_res = match ws_res {
+                        Ok(res) => res,
+                        Err(_) => {
+                            let mut s = state.lock().unwrap();
+                            s.diagnostics.last_error = Some("connect timeout".to_string());
+                            println!("[RustCore] connect attempt={attempt} timeout");
+                            if attempt >= max_attempts {
+                                s.connection_state = ConnectionStateInternal::Failed {
+                                    reason: "connect timeout".to_string(),
+                                };
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let (mut ws_stream, response) = match ws_res {
                         Ok(ok) => ok,
                         Err(e) => {
                             let mut s = state.lock().unwrap();
                             s.diagnostics.last_error = Some(e.to_string());
+                            println!("[RustCore] connect attempt={attempt} failed error={e}");
                             if attempt >= max_attempts {
                                 s.connection_state = ConnectionStateInternal::Failed {
                                     reason: e.to_string(),
@@ -439,6 +469,12 @@ async fn run_event_loop(
                             continue;
                         }
                     };
+                    println!(
+                        "[RustCore] handshake status={} extensions={:?} server={:?}",
+                        response.status(),
+                        response.headers().get("sec-websocket-extensions"),
+                        response.headers().get("server"),
+                    );
 
                     // Send handshake
                     let handshake = encode_client_command_wire(DCSSClientCommand::Handshake {
@@ -462,6 +498,7 @@ async fn run_event_loop(
                         s.diagnostics.last_connected_at = Some(SystemTime::now());
                         s.diagnostics.reconnect_attempt = None;
                     }
+                    println!("[RustCore] connect attempt={attempt} success");
 
                     // Connected loop
                     loop {
@@ -514,30 +551,86 @@ async fn run_event_loop(
                             msg = ws_stream.next() => {
                                 let msg = match msg {
                                     Some(m) => m,
-                                    None => break,
+                                    None => {
+                                        {
+                                            let mut s = state.lock().unwrap();
+                                            s.diagnostics.last_error = Some("socket stream ended (EOF)".to_string());
+                                        }
+                                        println!("[RustCore] socket stream ended (EOF)");
+                                        break;
+                                    }
                                 };
                                 match msg {
                                     Ok(WsMessage::Text(txt)) => {
+                                        println!(
+                                            "[RustCore] recv text len={} sample={}",
+                                            txt.len(),
+                                            txt.chars().take(180).collect::<String>()
+                                        );
                                         let event = decode_server_event(txt.as_bytes());
-                                        if let Ok(ev) = event {
-                                            apply_event(&state, &mut ws_stream, ev).await;
-                                        } else {
-                                            // decoding error -> reconnect
-                                            break;
+                                        match event {
+                                            Ok(ev) => {
+                                                apply_event(&state, &mut ws_stream, ev).await;
+                                            }
+                                            Err(e) => {
+                                                let msg = format!("decode text failed: {:?}", e);
+                                                {
+                                                    let mut s = state.lock().unwrap();
+                                                    s.diagnostics.last_error = Some(msg.clone());
+                                                }
+                                                println!("[RustCore] {msg}");
+                                                // Ignore unknown text frames and keep connection alive.
+                                                continue;
+                                            }
                                         }
                                     }
                                     Ok(WsMessage::Binary(bin)) => {
+                                        println!("[RustCore] recv binary len={}", bin.len());
                                         let event = decode_server_event(&bin);
-                                        if let Ok(ev) = event {
-                                            apply_event(&state, &mut ws_stream, ev).await;
-                                        } else {
-                                            break;
+                                        match event {
+                                            Ok(ev) => {
+                                                apply_event(&state, &mut ws_stream, ev).await;
+                                            }
+                                            Err(e) => {
+                                                let hex_preview = bin
+                                                    .iter()
+                                                    .take(24)
+                                                    .map(|b| format!("{:02x}", b))
+                                                    .collect::<Vec<_>>()
+                                                    .join(" ");
+                                                let msg = format!("decode binary failed: {:?}", e);
+                                                {
+                                                    let mut s = state.lock().unwrap();
+                                                    s.diagnostics.last_error = Some(msg.clone());
+                                                }
+                                                println!("[RustCore] {msg}; hex={hex_preview}");
+                                                // Some servers send binary housekeeping frames. Do not reconnect on them.
+                                                continue;
+                                            }
                                         }
                                     }
                                     Ok(WsMessage::Ping(_)) => {}
                                     Ok(WsMessage::Pong(_)) => {}
-                                    Ok(WsMessage::Close(_)) => break,
-                                    Err(_) => break,
+                                    Ok(WsMessage::Close(frame)) => {
+                                        let reason = frame
+                                            .as_ref()
+                                            .map(|f| format!("code={:?} reason={}", f.code, f.reason))
+                                            .unwrap_or_else(|| "no close frame".to_string());
+                                        {
+                                            let mut s = state.lock().unwrap();
+                                            s.diagnostics.last_error = Some(format!("socket closed: {reason}"));
+                                        }
+                                        println!("[RustCore] socket closed: {reason}");
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        {
+                                            let mut s = state.lock().unwrap();
+                                            s.diagnostics.last_error = Some(format!("socket error: {e}"));
+                                        }
+                                        println!("[RustCore] websocket read error: {e}");
+                                        break;
+                                    }
                                     _ => {}
                                 }
                             }
@@ -561,6 +654,7 @@ async fn run_event_loop(
                     if attempt >= max_attempts {
                         let mut s = state.lock().unwrap();
                         s.connection_state = ConnectionStateInternal::Failed { reason: "reconnect max attempts".to_string() };
+                        println!("[RustCore] reconnect max attempts reached");
                         break;
                     }
                 }
@@ -653,6 +747,7 @@ fn cstr_to_string<'a>(ptr: *const c_char) -> Option<String> {
 
 #[no_mangle]
 pub extern "C" fn dcss_session_create() -> *mut DCSSSession {
+    ensure_rustls_crypto_provider();
     let session = DCSSSession {
         inner: Session::new(),
     };

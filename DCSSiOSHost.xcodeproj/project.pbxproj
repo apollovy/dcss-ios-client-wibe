@@ -96,6 +96,8 @@
 			buildRules = (
 			);
 			dependencies = (
+				B51941DC2F7B27E600FC3AC5 /* PBXTargetDependency */,
+				B51941DA2F7B27E300FC3AC5 /* PBXTargetDependency */,
 			);
 			name = DCSSiOSHost;
 			packageProductDependencies = (
@@ -158,7 +160,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "\"${SRCROOT}/Scripts/build-rust-core.sh\"";
+			shellScript = "\"${SRCROOT}/Scripts/build-rust-core.sh\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -174,6 +176,17 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		B51941DA2F7B27E300FC3AC5 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			productRef = B51941D92F7B27E300FC3AC5 /* DCSSCore */;
+		};
+		B51941DC2F7B27E600FC3AC5 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			productRef = B51941DB2F7B27E600FC3AC5 /* DCSSCoreFFI */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		795AC7165F761B12F695B80A /* Release */ = {
@@ -383,6 +396,14 @@
 		2A274DD859F4BED6928BFD8A /* DCSSCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = DCSSCore;
+		};
+		B51941D92F7B27E300FC3AC5 /* DCSSCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = DCSSCore;
+		};
+		B51941DB2F7B27E600FC3AC5 /* DCSSCoreFFI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = DCSSCoreFFI;
 		};
 		F20FF298566305C9BE3C1B7B /* DCSSCoreFFI */ = {
 			isa = XCSwiftPackageProductDependency;
