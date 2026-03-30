@@ -1,100 +1,46 @@
 import Foundation
 import DCSSCore
 
-import Darwin
+// Прямые C-ABI функции, реализованные в Rust (`RustCore/src/lib.rs`).
+// Эти символы будут найдены линкером, когда libdcss_core.a / XCFramework
+// подключены к таргету Xcode.
+@_silgen_name("dcss_session_create")
+private func dcss_session_create() -> UnsafeMutableRawPointer?
+
+@_silgen_name("dcss_session_destroy")
+private func dcss_session_destroy(_ handle: UnsafeMutableRawPointer?)
+
+@_silgen_name("dcss_session_connect")
+private func dcss_session_connect(
+    _ handle: UnsafeMutableRawPointer?,
+    _ url: UnsafePointer<CChar>?,
+    _ clientVersion: UnsafePointer<CChar>?
+)
+
+@_silgen_name("dcss_session_disconnect")
+private func dcss_session_disconnect(_ handle: UnsafeMutableRawPointer?)
+
+@_silgen_name("dcss_session_send_input")
+private func dcss_session_send_input(_ handle: UnsafeMutableRawPointer?, _ command: UnsafePointer<CChar>?)
+
+@_silgen_name("dcss_session_send_heartbeat")
+private func dcss_session_send_heartbeat(_ handle: UnsafeMutableRawPointer?)
+
+@_silgen_name("dcss_session_app_did_enter_background")
+private func dcss_session_app_did_enter_background(_ handle: UnsafeMutableRawPointer?)
+
+@_silgen_name("dcss_session_app_will_enter_foreground")
+private func dcss_session_app_will_enter_foreground(_ handle: UnsafeMutableRawPointer?)
+
+@_silgen_name("dcss_session_get_snapshot_json")
+private func dcss_session_get_snapshot_json(_ handle: UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("dcss_free_string")
+private func dcss_free_string(_ ptr: UnsafeMutablePointer<CChar>?)
 
 private struct DCSSSessionHandle: @unchecked Sendable {
     let raw: UnsafeMutableRawPointer
 }
-
-private struct CoreAPILoader {
-    let libHandle: UnsafeMutableRawPointer
-
-    let sessionCreate: @convention(c) () -> UnsafeMutableRawPointer?
-    let sessionDestroy: @convention(c) (UnsafeMutableRawPointer?) -> Void
-
-    let sessionConnect: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void
-    let sessionDisconnect: @convention(c) (UnsafeMutableRawPointer?) -> Void
-    let sessionSendInput: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Void
-    let sessionSendHeartbeat: @convention(c) (UnsafeMutableRawPointer?) -> Void
-
-    let sessionDidEnterBackground: @convention(c) (UnsafeMutableRawPointer?) -> Void
-    let sessionWillEnterForeground: @convention(c) (UnsafeMutableRawPointer?) -> Void
-
-    let sessionGetSnapshotJSON: @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>?
-    let freeString: @convention(c) (UnsafeMutablePointer<CChar>?) -> Void
-
-    static func load() -> CoreAPILoader? {
-        let candidates: [String] = {
-            var list: [String] = []
-            if let env = ProcessInfo.processInfo.environment["DCSS_CORE_LIB_PATH"] {
-                list.append(env)
-            }
-            // Typical dev paths (best-effort).
-            list.append("./libdcss_core.dylib")
-            list.append("../RustCore/target/debug/libdcss_core.dylib")
-            list.append("../RustCore/target/release/libdcss_core.dylib")
-            return list
-        }()
-
-        // Also try bare name to let loader resolve it via rpath.
-        let fallbackNames = ["libdcss_core.dylib", "libdcss_core.so"]
-
-        func resolveSymbol<T>(_ symbol: String, _ lib: UnsafeMutableRawPointer) -> T? {
-            guard let sym = dlsym(lib, symbol) else { return nil }
-            return unsafeBitCast(sym, to: T.self)
-        }
-
-        for path in candidates + fallbackNames {
-            // RTLD_NOW avoids lazy symbol resolution failures at first call.
-            guard let handle = dlopen(path, RTLD_NOW) else { continue }
-
-            guard
-                let sessionCreate: @convention(c) () -> UnsafeMutableRawPointer? =
-                    resolveSymbol("dcss_session_create", handle),
-                let sessionDestroy: @convention(c) (UnsafeMutableRawPointer?) -> Void =
-                    resolveSymbol("dcss_session_destroy", handle),
-                let sessionConnect: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void =
-                    resolveSymbol("dcss_session_connect", handle),
-                let sessionDisconnect: @convention(c) (UnsafeMutableRawPointer?) -> Void =
-                    resolveSymbol("dcss_session_disconnect", handle),
-                let sessionSendInput: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Void =
-                    resolveSymbol("dcss_session_send_input", handle),
-                let sessionSendHeartbeat: @convention(c) (UnsafeMutableRawPointer?) -> Void =
-                    resolveSymbol("dcss_session_send_heartbeat", handle),
-                let sessionDidEnterBackground: @convention(c) (UnsafeMutableRawPointer?) -> Void =
-                    resolveSymbol("dcss_session_app_did_enter_background", handle),
-                let sessionWillEnterForeground: @convention(c) (UnsafeMutableRawPointer?) -> Void =
-                    resolveSymbol("dcss_session_app_will_enter_foreground", handle),
-                let sessionGetSnapshotJSON: @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutablePointer<CChar>? =
-                    resolveSymbol("dcss_session_get_snapshot_json", handle),
-                let freeString: @convention(c) (UnsafeMutablePointer<CChar>?) -> Void =
-                    resolveSymbol("dcss_free_string", handle)
-            else {
-                dlclose(handle)
-                continue
-            }
-
-            return CoreAPILoader(
-                libHandle: handle,
-                sessionCreate: sessionCreate,
-                sessionDestroy: sessionDestroy,
-                sessionConnect: sessionConnect,
-                sessionDisconnect: sessionDisconnect,
-                sessionSendInput: sessionSendInput,
-                sessionSendHeartbeat: sessionSendHeartbeat,
-                sessionDidEnterBackground: sessionDidEnterBackground,
-                sessionWillEnterForeground: sessionWillEnterForeground,
-                sessionGetSnapshotJSON: sessionGetSnapshotJSON,
-                freeString: freeString
-            )
-        }
-
-        return nil
-    }
-}
-
-extension CoreAPILoader: @unchecked Sendable {}
 
 private struct RustSnapshot: Decodable {
     struct ConnectionStateRepr: Decodable {
@@ -180,23 +126,19 @@ public enum RustSnapshotMapper {
 }
 
 public actor RustSessionClient: SessionClient {
-    private let api: CoreAPILoader
     private let handle: DCSSSessionHandle
 
     public static func makeOrNil() -> RustSessionClient? {
-        guard let api = CoreAPILoader.load() else { return nil }
-        guard let rawHandle = api.sessionCreate() else { return nil }
-        return RustSessionClient(api: api, handle: DCSSSessionHandle(raw: rawHandle))
+        guard let rawHandle = dcss_session_create() else { return nil }
+        return RustSessionClient(handle: DCSSSessionHandle(raw: rawHandle))
     }
 
-    private init(api: CoreAPILoader, handle: DCSSSessionHandle) {
-        self.api = api
+    private init(handle: DCSSSessionHandle) {
         self.handle = handle
     }
 
     deinit {
-        api.sessionDestroy(handle.raw)
-        dlclose(api.libHandle)
+        dcss_session_destroy(handle.raw)
     }
 
     public func connect(url: URL, clientVersion: String?) async {
@@ -204,45 +146,45 @@ public actor RustSessionClient: SessionClient {
         urlStr.withCString { urlC in
             if let clientVersion {
                 clientVersion.withCString { clientC in
-                    api.sessionConnect(handle.raw, urlC, clientC)
+                    dcss_session_connect(handle.raw, urlC, clientC)
                 }
             } else {
-                api.sessionConnect(handle.raw, urlC, nil)
+                dcss_session_connect(handle.raw, urlC, nil)
             }
         }
     }
 
     public func disconnect() async {
-        api.sessionDisconnect(handle.raw)
+        dcss_session_disconnect(handle.raw)
     }
 
     public func sendInput(_ command: String) async {
         command.withCString { c in
-            api.sessionSendInput(handle.raw, c)
+            dcss_session_send_input(handle.raw, c)
         }
     }
 
     public func sendHeartbeat() async {
-        api.sessionSendHeartbeat(handle.raw)
+        dcss_session_send_heartbeat(handle.raw)
     }
 
     public func appDidEnterBackground() async {
-        api.sessionDidEnterBackground(handle.raw)
+        dcss_session_app_did_enter_background(handle.raw)
     }
 
     public func appWillEnterForeground() async {
-        api.sessionWillEnterForeground(handle.raw)
+        dcss_session_app_will_enter_foreground(handle.raw)
     }
 
     public func stateSnapshot() async -> (DCSSConnectionState, GameState, SessionDiagnostics) {
-        let snapshotPtr = api.sessionGetSnapshotJSON(handle.raw)
+        let snapshotPtr = dcss_session_get_snapshot_json(handle.raw)
         guard let snapshotPtr else {
             let conn: DCSSConnectionState = .failed(reason: "core snapshot unavailable")
             return (conn, GameState(), SessionDiagnostics(lastEventType: nil, reconnectAttempt: nil, lastError: "core missing", lastConnectedAt: nil))
         }
 
         let json = String(cString: snapshotPtr)
-        api.freeString(snapshotPtr)
+        dcss_free_string(snapshotPtr)
         return RustSnapshotMapper.mapSnapshotJSON(json)
     }
 }

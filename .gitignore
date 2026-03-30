@@ -47,6 +47,7 @@ Carthage/Build/
 /RustCore/target/
 **/target/
 Cargo.lock
+/BuildArtifacts/
 
 # Environment and secrets
 .env
