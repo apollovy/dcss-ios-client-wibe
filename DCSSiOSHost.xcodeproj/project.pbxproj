@@ -8,6 +8,8 @@
 
 /* Begin PBXBuildFile section */
 		67905905BCC9155AC992BD27 /* HostViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DDFA8F709DE4200DF7F25D61 /* HostViewModel.swift */; };
+		8BAC10CCA7BE67806B31342A /* DCSSCoreFFI in Frameworks */ = {isa = PBXBuildFile; productRef = F20FF298566305C9BE3C1B7B /* DCSSCoreFFI */; };
+		9DBCB3AD888071EBAED86D86 /* DCSSCore.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4F56BF10419035EAE8F9A48F /* DCSSCore.xcframework */; };
 		DBF4147B8D477FB2703F2590 /* DCSSiOSHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1A18287CE8AE6D755230BE1 /* DCSSiOSHostApp.swift */; };
 		DE67786E7E840043E6492A68 /* HostContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4240452D7018CA814747E43 /* HostContentView.swift */; };
 		EBC5B61D099D4F3482C28FA0 /* DCSSCore in Frameworks */ = {isa = PBXBuildFile; productRef = 2A274DD859F4BED6928BFD8A /* DCSSCore */; };
@@ -15,6 +17,7 @@
 
 /* Begin PBXFileReference section */
 		1DC7963581AD31B37BA7C63F /* DCSSiOSHost.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DCSSiOSHost.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		4F56BF10419035EAE8F9A48F /* DCSSCore.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; name = DCSSCore.xcframework; path = BuildArtifacts/DCSSCore.xcframework; sourceTree = "<group>"; };
 		C1A18287CE8AE6D755230BE1 /* DCSSiOSHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DCSSiOSHostApp.swift; sourceTree = "<group>"; };
 		CE8EE564C1D81BCEC1D9E4D7 /* dcss-ios-client-wibe */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "dcss-ios-client-wibe"; path = .; sourceTree = SOURCE_ROOT; };
 		DDFA8F709DE4200DF7F25D61 /* HostViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HostViewModel.swift; sourceTree = "<group>"; };
@@ -26,7 +29,9 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				9DBCB3AD888071EBAED86D86 /* DCSSCore.xcframework in Frameworks */,
 				EBC5B61D099D4F3482C28FA0 /* DCSSCore in Frameworks */,
+				8BAC10CCA7BE67806B31342A /* DCSSCoreFFI in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -49,6 +54,14 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
+		960AAA9754389292D91011FC /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				4F56BF10419035EAE8F9A48F /* DCSSCore.xcframework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		9B35EFD40409C31E24772E7B /* iOSAppHost */ = {
 			isa = PBXGroup;
 			children = (
@@ -64,6 +77,7 @@
 			children = (
 				9B35EFD40409C31E24772E7B /* iOSAppHost */,
 				1214282A31F318BF56C16865 /* Packages */,
+				960AAA9754389292D91011FC /* Frameworks */,
 				75016F3FED0B871787427456 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -75,6 +89,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = CD7787E58FEBD71AA6782B52 /* Build configuration list for PBXNativeTarget "DCSSiOSHost" */;
 			buildPhases = (
+				21B71A4E007421908E3B7654 /* Build Rust DCSS Core */,
 				07223DC5EE6B1F2AF5BA3776 /* Sources */,
 				D47F77C89F70B5C9081AB848 /* Frameworks */,
 			);
@@ -85,6 +100,7 @@
 			name = DCSSiOSHost;
 			packageProductDependencies = (
 				2A274DD859F4BED6928BFD8A /* DCSSCore */,
+				F20FF298566305C9BE3C1B7B /* DCSSCoreFFI */,
 			);
 			productName = DCSSiOSHost;
 			productReference = 1DC7963581AD31B37BA7C63F /* DCSSiOSHost.app */;
@@ -120,6 +136,31 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		21B71A4E007421908E3B7654 /* Build Rust DCSS Core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/RustCore/Cargo.toml",
+				"$(SRCROOT)/RustCore/src/lib.rs",
+			);
+			name = "Build Rust DCSS Core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/BuildArtifacts/.rust_core_built",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${SRCROOT}/Scripts/build-rust-core.sh\"";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		07223DC5EE6B1F2AF5BA3776 /* Sources */ = {
@@ -197,6 +238,10 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				DEVELOPMENT_TEAM = 3NJUD9MLAB;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"BuildArtifacts\"",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DCSS iOS Host";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -283,6 +328,10 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				DEVELOPMENT_TEAM = 3NJUD9MLAB;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"BuildArtifacts\"",
+				);
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "DCSS iOS Host";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -334,6 +383,10 @@
 		2A274DD859F4BED6928BFD8A /* DCSSCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = DCSSCore;
+		};
+		F20FF298566305C9BE3C1B7B /* DCSSCoreFFI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = DCSSCoreFFI;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

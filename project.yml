@@ -11,6 +11,15 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "17.0"
+    preBuildScripts:
+      - name: Build Rust DCSS Core
+        script: "\"${SRCROOT}/Scripts/build-rust-core.sh\""
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(SRCROOT)/RustCore/Cargo.toml
+          - $(SRCROOT)/RustCore/src/lib.rs
+        outputFiles:
+          - $(SRCROOT)/BuildArtifacts/.rust_core_built
     sources:
       - iOSAppHost
     settings:
@@ -23,8 +32,12 @@ targets:
         INFOPLIST_KEY_UIRequiresFullScreen: NO
         SWIFT_VERSION: 6.0
     dependencies:
+      - framework: BuildArtifacts/DCSSCore.xcframework
+        embed: false
       - package: DCSSiOSClient
         product: DCSSCore
+      - package: DCSSiOSClient
+        product: DCSSCoreFFI
 schemes:
   DCSSiOSHost:
     build:

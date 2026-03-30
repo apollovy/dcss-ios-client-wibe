@@ -159,6 +159,7 @@ if command -v xcodebuild >/dev/null 2>&1; then
 
   if [[ ${#XC_ARGS[@]} -eq 0 ]]; then
     echo "warning: no architecture libs for XCFramework; skipping" >&2
+    touch "${OUT_DIR}/.rust_core_built"
     echo "==> Rust core build finished."
     exit 0
   fi
@@ -174,5 +175,6 @@ if command -v xcodebuild >/dev/null 2>&1; then
   fi
 fi
 
+touch "${OUT_DIR}/.rust_core_built"
 echo "==> Rust core build finished."
 

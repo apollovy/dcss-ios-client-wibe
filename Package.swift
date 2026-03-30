@@ -9,6 +9,7 @@ let package = Package(
     ],
     products: [
         .library(name: "DCSSCore", targets: ["DCSSCore"]),
+        .library(name: "DCSSCoreFFI", targets: ["DCSSCoreFFI"]),
         .executable(name: "DCSSApp", targets: ["DCSSApp"])
     ],
     targets: [
