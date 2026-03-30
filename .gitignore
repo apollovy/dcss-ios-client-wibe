@@ -1,0 +1,49 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Packages/
+Package.resolved
+
+# Xcode
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcuserdatad/
+*.xcuserstate
+
+# App bundles and archives
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.xcarchive
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# Fastlane
+test_output/
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+# CocoaPods
+Pods/
+
+# Carthage
+Carthage/Build/
+
+# Temporary and logs
+*.log
+*.tmp
+.DS_Store
+
+# Cursor/IDE local
+.cursor/
+.cursorignore
+
+# Environment and secrets
+.env
+.env.*
+*.p12
+*.mobileprovision
