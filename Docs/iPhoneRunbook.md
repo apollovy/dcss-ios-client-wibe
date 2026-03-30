@@ -22,14 +22,14 @@
 
 ## Smoke checklist
 
-- [ ] App opens and Connect screen is interactive.
-- [ ] Enter real endpoint and tap Connect.
-- [ ] Status becomes `connected` and "Last connected at" is populated.
-- [ ] Game frame is visible on Game tab.
-- [ ] Send a command and verify server responds.
-- [ ] Toggle network (airplane mode on/off) and verify reconnect behavior.
-- [ ] Put app background -> foreground and verify session recovery.
-- [ ] Disconnect performs clean stop (state returns to idle).
+- App opens and Connect screen is interactive.
+- Enter real endpoint and tap Connect.
+- Status becomes `connected` and "Last connected at" is populated.
+- Game frame is visible on Game tab.
+- Send a command and verify server responds.
+- Toggle network (airplane mode on/off) and verify reconnect behavior.
+- Put app background -> foreground and verify session recovery.
+- Disconnect performs clean stop (state returns to idle).
 
 ## Debug hints
 
@@ -39,3 +39,4 @@
   - Last error
   - Last connected at
 - If connection fails, capture endpoint + last error text from the app.
+

@@ -27,9 +27,9 @@ swift test
 
 ## Run on iPhone (Xcode USB)
 
-1. Open project folder in Xcode.
-2. Select `DCSSApp` scheme and your iPhone as target.
-3. Configure Signing team.
+1. Open `DCSSiOSHost.xcodeproj` in Xcode.
+2. Select `DCSSiOSHost` scheme and your iPhone as target.
+3. In target settings, set your Team in `Signing & Capabilities`.
 4. Run and enter a real `wss://...` endpoint on Connect screen.
 
 See detailed steps in `Docs/iPhoneRunbook.md`.
