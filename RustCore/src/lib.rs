@@ -11,6 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use libc::free;
 use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib};
 use serde::{Deserialize, Serialize};
+use serde_json::de::Deserializer;
 use serde_json::Value;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
@@ -105,10 +106,29 @@ fn parse_grid(payload: &HashMap<String, Value>) -> Vec<String> {
 
 fn decode_server_event(data: &[u8]) -> Result<DCSSServerEvent, ProtocolCodecError> {
     let s = std::str::from_utf8(data).map_err(|_| ProtocolCodecError::InvalidUtf8)?;
-    let value: Value = serde_json::from_str(s).map_err(|e| {
-        ProtocolCodecError::MalformedPayload(format!("invalid json: {e}"))
-    })?;
+    let value: Value = serde_json::from_str(s)
+        .map_err(|e| ProtocolCodecError::MalformedPayload(format!("invalid json: {e}")))?;
+    decode_server_value(value)
+}
 
+fn decode_server_events(data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+    let s = std::str::from_utf8(data).map_err(|_| ProtocolCodecError::InvalidUtf8)?;
+    let mut events = Vec::new();
+    let stream = Deserializer::from_str(s).into_iter::<Value>();
+    for item in stream {
+        let value = item
+            .map_err(|e| ProtocolCodecError::MalformedPayload(format!("invalid json stream: {e}")))?;
+        events.push(decode_server_value(value)?);
+    }
+    if events.is_empty() {
+        return Err(ProtocolCodecError::MalformedPayload(
+            "json stream produced no events".to_string(),
+        ));
+    }
+    Ok(events)
+}
+
+fn decode_server_value(value: Value) -> Result<DCSSServerEvent, ProtocolCodecError> {
     let obj = value.as_object().ok_or_else(|| {
         ProtocolCodecError::MalformedPayload("expected json object".to_string())
     })?;
@@ -137,25 +157,25 @@ fn decode_server_event(data: &[u8]) -> Result<DCSSServerEvent, ProtocolCodecErro
     decode_by_type(type_name, &payload)
 }
 
-fn decode_server_event_binary(data: &[u8]) -> Result<DCSSServerEvent, ProtocolCodecError> {
+fn decode_server_event_binary(data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
     // 1) Try as plain UTF-8 JSON first.
-    if let Ok(ev) = decode_server_event(data) {
-        return Ok(ev);
+    if let Ok(events) = decode_server_events(data) {
+        return Ok(events);
     }
 
     // 2) Try zlib-wrapped DEFLATE (common pako/default case).
     if let Ok(inflated) = decompress_to_vec_zlib(data) {
-        if let Ok(ev) = decode_server_event(&inflated) {
+        if let Ok(events) = decode_server_events(&inflated) {
             println!("[RustCore] binary payload decoded via zlib inflate");
-            return Ok(ev);
+            return Ok(events);
         }
     }
 
     // 3) Try raw DEFLATE (pako inflateRaw case).
     if let Ok(inflated) = decompress_to_vec(data) {
-        if let Ok(ev) = decode_server_event(&inflated) {
+        if let Ok(events) = decode_server_events(&inflated) {
             println!("[RustCore] binary payload decoded via raw deflate");
-            return Ok(ev);
+            return Ok(events);
         }
     }
 
@@ -625,10 +645,12 @@ async fn run_event_loop(
                                             txt.len(),
                                             txt.chars().take(180).collect::<String>()
                                         );
-                                        let event = decode_server_event(txt.as_bytes());
-                                        match event {
-                                            Ok(ev) => {
-                                                apply_event(&state, &mut ws_stream, ev).await;
+                                        let events = decode_server_events(txt.as_bytes());
+                                        match events {
+                                            Ok(decoded) => {
+                                                for ev in decoded {
+                                                    apply_event(&state, &mut ws_stream, ev).await;
+                                                }
                                             }
                                             Err(e) => {
                                                 let msg = format!("decode text failed: {:?}", e);
@@ -650,7 +672,7 @@ async fn run_event_loop(
                                                     "[RustCore] binary payload decoded via stateful deflate len={}",
                                                     inflated.len()
                                                 );
-                                                decode_server_event(&inflated)
+                                                decode_server_events(&inflated)
                                             }
                                             Err(err) => {
                                                 println!("[RustCore] stateful inflater miss: {err}");
@@ -658,8 +680,10 @@ async fn run_event_loop(
                                             }
                                         };
                                         match event {
-                                            Ok(ev) => {
-                                                apply_event(&state, &mut ws_stream, ev).await;
+                                            Ok(decoded) => {
+                                                for ev in decoded {
+                                                    apply_event(&state, &mut ws_stream, ev).await;
+                                                }
                                             }
                                             Err(e) => {
                                                 let hex_preview = bin
