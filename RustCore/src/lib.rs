@@ -6,8 +6,10 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
+use flate2::{Decompress, FlushDecompress};
 use futures_util::{SinkExt, StreamExt};
 use libc::free;
+use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::runtime::Runtime;
@@ -133,6 +135,60 @@ fn decode_server_event(data: &[u8]) -> Result<DCSSServerEvent, ProtocolCodecErro
         .unwrap_or("unknown");
     let payload: HashMap<String, Value> = obj.clone().into_iter().collect();
     decode_by_type(type_name, &payload)
+}
+
+fn decode_server_event_binary(data: &[u8]) -> Result<DCSSServerEvent, ProtocolCodecError> {
+    // 1) Try as plain UTF-8 JSON first.
+    if let Ok(ev) = decode_server_event(data) {
+        return Ok(ev);
+    }
+
+    // 2) Try zlib-wrapped DEFLATE (common pako/default case).
+    if let Ok(inflated) = decompress_to_vec_zlib(data) {
+        if let Ok(ev) = decode_server_event(&inflated) {
+            println!("[RustCore] binary payload decoded via zlib inflate");
+            return Ok(ev);
+        }
+    }
+
+    // 3) Try raw DEFLATE (pako inflateRaw case).
+    if let Ok(inflated) = decompress_to_vec(data) {
+        if let Ok(ev) = decode_server_event(&inflated) {
+            println!("[RustCore] binary payload decoded via raw deflate");
+            return Ok(ev);
+        }
+    }
+
+    Err(ProtocolCodecError::MalformedPayload(
+        "binary payload is not plain/inflated JSON".to_string(),
+    ))
+}
+
+struct StatefulBinaryInflater {
+    raw: Decompress,
+}
+
+impl StatefulBinaryInflater {
+    fn new() -> Self {
+        // false => raw DEFLATE stream (no zlib/gzip header), matches permessage-deflate payloads.
+        Self {
+            raw: Decompress::new(false),
+        }
+    }
+
+    fn decode_json_bytes(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        // RFC7692/permessage-deflate messages are usually terminated with Z_SYNC_FLUSH marker.
+        // To inflate each WS frame while keeping context takeover, append trailer then keep inflater state.
+        let mut input = Vec::with_capacity(data.len() + 4);
+        input.extend_from_slice(data);
+        input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+
+        let mut out = Vec::with_capacity(data.len() * 4 + 64);
+        self.raw
+            .decompress_vec(&input, &mut out, FlushDecompress::Sync)
+            .map_err(|e| format!("stateful raw inflate failed: {e}"))?;
+        Ok(out)
+    }
 }
 
 fn decode_by_type(type_name: &str, payload: &HashMap<String, Value>) -> Result<DCSSServerEvent, ProtocolCodecError> {
@@ -500,6 +556,8 @@ async fn run_event_loop(
                     }
                     println!("[RustCore] connect attempt={attempt} success");
 
+                    let mut binary_inflater = StatefulBinaryInflater::new();
+
                     // Connected loop
                     loop {
                         tokio::select! {
@@ -586,7 +644,19 @@ async fn run_event_loop(
                                     }
                                     Ok(WsMessage::Binary(bin)) => {
                                         println!("[RustCore] recv binary len={}", bin.len());
-                                        let event = decode_server_event(&bin);
+                                        let event = match binary_inflater.decode_json_bytes(&bin) {
+                                            Ok(inflated) => {
+                                                println!(
+                                                    "[RustCore] binary payload decoded via stateful deflate len={}",
+                                                    inflated.len()
+                                                );
+                                                decode_server_event(&inflated)
+                                            }
+                                            Err(err) => {
+                                                println!("[RustCore] stateful inflater miss: {err}");
+                                                decode_server_event_binary(&bin)
+                                            }
+                                        };
                                         match event {
                                             Ok(ev) => {
                                                 apply_event(&state, &mut ws_stream, ev).await;
