@@ -42,6 +42,12 @@ Carthage/Build/
 .cursor/
 .cursorignore
 
+# Rust / Cargo
+/.cargo/
+/RustCore/target/
+**/target/
+Cargo.lock
+
 # Environment and secrets
 .env
 .env.*

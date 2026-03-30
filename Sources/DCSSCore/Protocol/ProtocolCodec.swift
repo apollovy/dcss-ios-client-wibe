@@ -6,6 +6,11 @@ public enum ProtocolCodecError: Error, Equatable {
     case malformedPayload(String)
 }
 
+/// Swift fallback protocol codec for the MVP wire contract.
+///
+/// Note: the main wire/protocol path is implemented in Rust (`RustCore`) and consumed via
+/// `RustSessionClient` (FFI) from `DCSSCoreFFI`. This codec stays to keep `SessionActor`
+/// working when the Rust dynamic library cannot be loaded.
 public struct ProtocolCodec: Sendable {
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()

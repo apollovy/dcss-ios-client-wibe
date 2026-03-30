@@ -16,14 +16,19 @@ let package = Package(
             name: "DCSSCore",
             path: "Sources/DCSSCore"
         ),
+        .target(
+            name: "DCSSCoreFFI",
+            dependencies: ["DCSSCore"],
+            path: "Sources/DCSSCoreFFI"
+        ),
         .executableTarget(
             name: "DCSSApp",
-            dependencies: ["DCSSCore"],
+            dependencies: ["DCSSCore", "DCSSCoreFFI"],
             path: "Sources/DCSSApp"
         ),
         .testTarget(
             name: "DCSSCoreTests",
-            dependencies: ["DCSSCore"],
+            dependencies: ["DCSSCore", "DCSSCoreFFI"],
             path: "Tests/DCSSCoreTests",
             resources: [
                 .copy("Fixtures")

@@ -14,7 +14,11 @@ public struct SessionDiagnostics: Equatable, Sendable {
     }
 }
 
-public actor SessionActor {
+/// Swift fallback implementation of session + protocol codec.
+///
+/// Primary implementation is `RustSessionClient` from `DCSSCoreFFI` (FFI) — `SessionActor`
+/// remains here to support builds where the Rust dynamic library is not present.
+public actor SessionActor: SessionClient {
     private let transport: WebSocketTransporting
     private let codec: ProtocolCodec
     private let reconnectPolicy: ReconnectPolicy
@@ -41,13 +45,14 @@ public actor SessionActor {
         receiveTask?.cancel()
     }
 
-    public func connect(url: URL, clientVersion: String = "dcss-ios-0.1") async {
+    public func connect(url: URL, clientVersion: String? = nil) async {
         endpoint = url
         connectionState = .connecting
         diagnostics.lastError = nil
         do {
             try await transport.connect(to: url)
-            let handshake = try codec.encode(command: .handshake(clientVersion: clientVersion))
+            let resolvedClientVersion = clientVersion ?? "dcss-ios-0.1"
+            let handshake = try codec.encode(command: .handshake(clientVersion: resolvedClientVersion))
             try await transport.send(handshake)
             connectionState = .connected
             diagnostics.lastConnectedAt = Date()
@@ -77,7 +82,7 @@ public actor SessionActor {
         }
     }
 
-    public func stateSnapshot() -> (DCSSConnectionState, GameState, SessionDiagnostics) {
+    public func stateSnapshot() async -> (DCSSConnectionState, GameState, SessionDiagnostics) {
         (connectionState, gameState, diagnostics)
     }
 

@@ -1,4 +1,5 @@
 import DCSSCore
+import DCSSCoreFFI
 import Foundation
 import Observation
 
@@ -19,11 +20,14 @@ final class GameViewModel {
     var debugLastConnectedAt = "-"
 
     private let settings: SettingsStore
-    private let session: SessionActor
+    private nonisolated let session: any SessionClient
 
-    init(settings: SettingsStore = UserDefaultsSettingsStore(), session: SessionActor = SessionActor(transport: WebSocketTransport())) {
+    init(
+        settings: SettingsStore = UserDefaultsSettingsStore(),
+        session: (any SessionClient)? = nil
+    ) {
         self.settings = settings
-        self.session = session
+        self.session = session ?? RustSessionClient.makeOrNil() ?? SessionActor(transport: WebSocketTransport())
         self.serverURL = settings.serverURLString
         self.fontScale = settings.fontScale
     }
@@ -36,7 +40,7 @@ final class GameViewModel {
             return
         }
 
-        await session.connect(url: url)
+        await session.connect(url: url, clientVersion: nil)
         await syncFromSession()
     }
 

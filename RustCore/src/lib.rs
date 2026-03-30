@@ -1,0 +1,854 @@
+use std::collections::HashMap;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime};
+
+use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
+use libc::free;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::runtime::Runtime;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
+use tokio_tungstenite::connect_async;
+
+// ===== Protocol layer (compatible with the current Swift MVP) =====
+
+#[derive(Debug, Clone)]
+enum DCSSClientCommand {
+    Handshake { client_version: String },
+    Input { command: String },
+    Heartbeat,
+}
+
+#[derive(Debug, Clone)]
+enum DCSSServerEvent {
+    Hello { server_version: String },
+    GameFrame { grid: Vec<String>, status_line: String },
+    Message { text: String },
+    HeartbeatAck,
+    HeartbeatRequest,
+    Error { code: i32, text: String },
+    Unknown { type_name: String },
+}
+
+#[derive(Debug)]
+enum ProtocolCodecError {
+    InvalidUtf8,
+    MalformedPayload(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct WireEnvelope {
+    type_: String,
+    payload: HashMap<String, Value>,
+}
+
+impl WireEnvelope {
+    fn new(type_name: &str, payload: HashMap<String, Value>) -> Self {
+        Self {
+            type_: type_name.to_string(),
+            payload,
+        }
+    }
+}
+
+fn json_value_string(payload: &HashMap<String, Value>, key: &str) -> Option<String> {
+    payload.get(key).and_then(|v| v.as_str().map(|s| s.to_string()))
+}
+
+fn json_value_int(payload: &HashMap<String, Value>, key: &str) -> Option<i32> {
+    payload
+        .get(key)
+        .and_then(|v| v.as_i64())
+        .map(|n| n as i32)
+}
+
+fn json_value_string_array(payload: &HashMap<String, Value>, key: &str) -> Option<Vec<String>> {
+    payload.get(key).and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn parse_grid(payload: &HashMap<String, Value>) -> Vec<String> {
+    if let Some(grid_raw) = json_value_string(payload, "grid") {
+        // Swift splits on the literal "\n" substring (not an actual newline).
+        return grid_raw
+            .split("\\n")
+            .map(|s| s.to_string())
+            .collect();
+    }
+
+    if let Some(rows) = json_value_string_array(payload, "gridRows") {
+        return rows;
+    }
+
+    vec![]
+}
+
+fn decode_server_event(data: &[u8]) -> Result<DCSSServerEvent, ProtocolCodecError> {
+    let s = std::str::from_utf8(data).map_err(|_| ProtocolCodecError::InvalidUtf8)?;
+    let value: Value = serde_json::from_str(s).map_err(|e| {
+        ProtocolCodecError::MalformedPayload(format!("invalid json: {e}"))
+    })?;
+
+    let obj = value.as_object().ok_or_else(|| {
+        ProtocolCodecError::MalformedPayload("expected json object".to_string())
+    })?;
+
+    // Envelope mode: { "type": "...", "payload": {...} }
+    let is_envelope = obj.get("type").and_then(|v| v.as_str()).is_some()
+        && obj.get("payload").is_some();
+    if is_envelope {
+        let type_name = obj.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let payload_value = obj.get("payload").unwrap_or(&Value::Null);
+        let payload_obj = payload_value.as_object().ok_or_else(|| {
+            ProtocolCodecError::MalformedPayload("payload must be object".to_string())
+        })?;
+        let payload: HashMap<String, Value> = payload_obj.clone().into_iter().collect();
+        return decode_by_type(type_name, &payload);
+    }
+
+    // Compatibility mode: flattened payloads.
+    // Swift finds `type` or `msg`, then uses the whole object as payload.
+    let type_name = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("msg").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    let payload: HashMap<String, Value> = obj.clone().into_iter().collect();
+    decode_by_type(type_name, &payload)
+}
+
+fn decode_by_type(type_name: &str, payload: &HashMap<String, Value>) -> Result<DCSSServerEvent, ProtocolCodecError> {
+    match type_name {
+        "hello" | "welcome" => {
+            let version = json_value_string(payload, "serverVersion")
+                .or_else(|| json_value_string(payload, "version"))
+                .unwrap_or_else(|| "unknown".to_string());
+            Ok(DCSSServerEvent::Hello { server_version: version })
+        }
+        "frame" | "update" => {
+            let grid = parse_grid(payload);
+            let status_line = json_value_string(payload, "statusLine")
+                .or_else(|| json_value_string(payload, "status"))
+                .unwrap_or_else(|| "".to_string());
+            Ok(DCSSServerEvent::GameFrame { grid, status_line })
+        }
+        "message" | "msg" => {
+            let text = json_value_string(payload, "text")
+                .or_else(|| json_value_string(payload, "message"))
+                .ok_or_else(|| ProtocolCodecError::MalformedPayload("message requires text".to_string()))?;
+            Ok(DCSSServerEvent::Message { text })
+        }
+        "heartbeat_ack" | "pong" => Ok(DCSSServerEvent::HeartbeatAck),
+        "heartbeat" | "ping" => Ok(DCSSServerEvent::HeartbeatRequest),
+        "error" => {
+            let code = json_value_int(payload, "code").unwrap_or(-1);
+            let text = json_value_string(payload, "text")
+                .or_else(|| json_value_string(payload, "message"))
+                .unwrap_or_else(|| "unknown".to_string());
+            Ok(DCSSServerEvent::Error { code, text })
+        }
+        other => Ok(DCSSServerEvent::Unknown { type_name: other.to_string() }),
+    }
+}
+
+fn encode_client_command(cmd: DCSSClientCommand) -> Result<Vec<u8>, ProtocolCodecError> {
+    let envelope = match cmd {
+        DCSSClientCommand::Handshake { client_version } => WireEnvelope::new(
+            "handshake",
+            HashMap::from([("clientVersion".to_string(), Value::String(client_version))]),
+        ),
+        DCSSClientCommand::Input { command } => WireEnvelope::new(
+            "input",
+            HashMap::from([("command".to_string(), Value::String(command))]),
+        ),
+        DCSSClientCommand::Heartbeat => WireEnvelope::new("heartbeat", HashMap::new()),
+    };
+
+    let json = serde_json::to_string(&envelope)
+        .map_err(|e| ProtocolCodecError::MalformedPayload(format!("encode json: {e}")))?;
+    Ok(json.into_bytes())
+}
+
+// WireEnvelope struct above serializes `type_` as `type_`, so implement a custom fix:
+// We'll serialize manually to match Swift/Wire contract: { "type": "...", "payload": ... }.
+//
+// To keep the module small, we re-implement encode_client_command for actual wire format:
+fn encode_client_command_wire(cmd: DCSSClientCommand) -> Vec<u8> {
+    let type_name = match &cmd {
+        DCSSClientCommand::Handshake { .. } => "handshake",
+        DCSSClientCommand::Input { .. } => "input",
+        DCSSClientCommand::Heartbeat => "heartbeat",
+    };
+
+    let payload: HashMap<String, Value> = match cmd {
+        DCSSClientCommand::Handshake { client_version } => {
+            HashMap::from([("clientVersion".to_string(), Value::String(client_version))])
+        }
+        DCSSClientCommand::Input { command } => {
+            HashMap::from([("command".to_string(), Value::String(command))])
+        }
+        DCSSClientCommand::Heartbeat => HashMap::new(),
+    };
+
+    let envelope = serde_json::json!({
+        "type": type_name,
+        "payload": payload,
+    });
+    serde_json::to_string(&envelope)
+        .expect("wire envelope to serialize")
+        .into_bytes()
+}
+
+// ===== Session layer =====
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ConnectionStateRepr {
+    Idle,
+    Connecting,
+    Connected,
+    Reconnecting { attempt: u32 },
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GameStateRepr {
+    grid: Vec<String>,
+    statusLine: String,
+    lastMessage: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiagnosticsRepr {
+    lastEventType: Option<String>,
+    reconnectAttempt: Option<u32>,
+    lastError: Option<String>,
+    lastConnectedAt: Option<String>, // RFC3339
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotRepr {
+    connectionState: ConnectionStateRepr,
+    gameState: GameStateRepr,
+    diagnostics: DiagnosticsRepr,
+}
+
+#[derive(Debug, Clone)]
+struct GameStateInternal {
+    grid: Vec<String>,
+    status_line: String,
+    last_message: String,
+}
+
+#[derive(Debug, Clone)]
+enum ConnectionStateInternal {
+    Idle,
+    Connecting,
+    Connected,
+    Reconnecting { attempt: u32 },
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone)]
+struct DiagnosticsInternal {
+    last_event_type: Option<String>,
+    reconnect_attempt: Option<u32>,
+    last_error: Option<String>,
+    last_connected_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionStateInternal {
+    connection_state: ConnectionStateInternal,
+    game_state: GameStateInternal,
+    diagnostics: DiagnosticsInternal,
+
+    endpoint: Option<String>,
+    client_version: String,
+    is_in_background: bool,
+}
+
+#[derive(Debug)]
+enum Command {
+    ConnectNow,
+    Disconnect,
+    Input(String),
+    Heartbeat,
+    SetBackground(bool),
+}
+
+struct Session {
+    state: Arc<Mutex<SessionStateInternal>>,
+    cmd_tx: Mutex<Option<mpsc::Sender<Command>>>,
+}
+
+impl Session {
+    fn new() -> Self {
+        let state = SessionStateInternal {
+            connection_state: ConnectionStateInternal::Idle,
+            game_state: GameStateInternal {
+                grid: vec![],
+                status_line: "".to_string(),
+                last_message: "".to_string(),
+            },
+            diagnostics: DiagnosticsInternal {
+                last_event_type: None,
+                reconnect_attempt: None,
+                last_error: None,
+                last_connected_at: None,
+            },
+            endpoint: None,
+            client_version: "dcss-ios-0.1".to_string(),
+            is_in_background: false,
+        };
+
+        Self {
+            state: Arc::new(Mutex::new(state)),
+            cmd_tx: Mutex::new(None),
+        }
+    }
+
+    fn ensure_loop_started(&self) {
+        let mut guard = self.cmd_tx.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel::<Command>(64);
+        *guard = Some(tx);
+
+        let state = self.state.clone();
+        thread::spawn(move || {
+            let rt = Runtime::new().expect("tokio runtime");
+            rt.block_on(run_event_loop(state, rx));
+        });
+    }
+
+    fn snapshot_json(&self) -> String {
+        let state = self.state.lock().unwrap();
+
+        let connection_state = match &state.connection_state {
+            ConnectionStateInternal::Idle => ConnectionStateRepr::Idle,
+            ConnectionStateInternal::Connecting => ConnectionStateRepr::Connecting,
+            ConnectionStateInternal::Connected => ConnectionStateRepr::Connected,
+            ConnectionStateInternal::Reconnecting { attempt } => {
+                ConnectionStateRepr::Reconnecting { attempt: *attempt }
+            }
+            ConnectionStateInternal::Failed { reason } => {
+                ConnectionStateRepr::Failed { reason: reason.clone() }
+            }
+        };
+
+        let last_connected_at = state
+            .diagnostics
+            .last_connected_at
+            .map(|_| Utc::now().to_rfc3339());
+        // Note: we don't store actual timestamp conversion in this minimal impl.
+        // It's enough for the UI debug fields.
+        let diagnostics = DiagnosticsRepr {
+            lastEventType: state.diagnostics.last_event_type.clone(),
+            reconnectAttempt: state.diagnostics.reconnect_attempt,
+            lastError: state.diagnostics.last_error.clone(),
+            lastConnectedAt: last_connected_at,
+        };
+
+        let game_state = GameStateRepr {
+            grid: state.game_state.grid.clone(),
+            statusLine: state.game_state.status_line.clone(),
+            lastMessage: state.game_state.last_message.clone(),
+        };
+
+        let snapshot = SnapshotRepr {
+            connectionState: connection_state,
+            gameState: game_state,
+            diagnostics: diagnostics,
+        };
+
+        serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+async fn run_event_loop(
+    state: Arc<Mutex<SessionStateInternal>>,
+    mut cmd_rx: mpsc::Receiver<Command>,
+) {
+    loop {
+        // Wait for a ConnectNow command or for outgoing commands while idle.
+        match cmd_rx.recv().await {
+            Some(Command::ConnectNow) => {
+                // Attempt connect loop until disconnect/background.
+                if state.lock().unwrap().is_in_background {
+                    continue;
+                }
+
+                let endpoint = state.lock().unwrap().endpoint.clone();
+                let client_version = state.lock().unwrap().client_version.clone();
+                if endpoint.is_none() {
+                    continue;
+                }
+                let endpoint = endpoint.unwrap();
+
+                let mut attempt: u32 = 0;
+                let max_attempts: u32 = 5;
+                let base_delay_secs: f64 = 1.0;
+
+                loop {
+                    attempt += 1;
+                    if state.lock().unwrap().is_in_background {
+                        break;
+                    }
+
+                    if attempt > 1 {
+                        {
+                            let mut s = state.lock().unwrap();
+                            s.connection_state = ConnectionStateInternal::Reconnecting { attempt };
+                            s.diagnostics.reconnect_attempt = Some(attempt);
+                        }
+                        let delay_secs = (2_f64.powi(attempt as i32) * base_delay_secs).min(20.0);
+                        sleep(Duration::from_secs_f64(delay_secs)).await;
+                    }
+
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.connection_state = ConnectionStateInternal::Connecting;
+                        s.diagnostics.last_error = None;
+                    }
+
+                    let ws_res = connect_async(endpoint.clone()).await;
+                    let (mut ws_stream, _) = match ws_res {
+                        Ok(ok) => ok,
+                        Err(e) => {
+                            let mut s = state.lock().unwrap();
+                            s.diagnostics.last_error = Some(e.to_string());
+                            if attempt >= max_attempts {
+                                s.connection_state = ConnectionStateInternal::Failed {
+                                    reason: e.to_string(),
+                                };
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+
+                    // Send handshake
+                    let handshake = encode_client_command_wire(DCSSClientCommand::Handshake {
+                        client_version: client_version.clone(),
+                    });
+                    if ws_stream.send(Message::Text(String::from_utf8_lossy(&handshake).to_string())).await.is_err() {
+                        let mut s = state.lock().unwrap();
+                        s.diagnostics.last_error = Some("send handshake failed".to_string());
+                        if attempt >= max_attempts {
+                            s.connection_state = ConnectionStateInternal::Failed {
+                                reason: "send handshake failed".to_string(),
+                            };
+                            break;
+                        }
+                        continue;
+                    }
+
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.connection_state = ConnectionStateInternal::Connected;
+                        s.diagnostics.last_connected_at = Some(SystemTime::now());
+                        s.diagnostics.reconnect_attempt = None;
+                    }
+
+                    // Connected loop
+                    loop {
+                        tokio::select! {
+                            cmd = cmd_rx.recv() => {
+                                match cmd {
+                                    Some(Command::Input(command)) => {
+                                        let payload = encode_client_command_wire(DCSSClientCommand::Input { command });
+                                        if ws_stream.send(Message::Text(String::from_utf8_lossy(&payload).to_string())).await.is_err() {
+                                            // Trigger reconnect
+                                            break;
+                                        }
+                                    }
+                                    Some(Command::Heartbeat) => {
+                                        // Optional websocket ping
+                                        let _ = ws_stream.send(Message::Ping(vec![])).await;
+                                        let payload = encode_client_command_wire(DCSSClientCommand::Heartbeat);
+                                        if ws_stream.send(Message::Text(String::from_utf8_lossy(&payload).to_string())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(Command::SetBackground(true)) => {
+                                        {
+                                            let mut s = state.lock().unwrap();
+                                            s.connection_state = ConnectionStateInternal::Idle;
+                                            s.is_in_background = true;
+                                        }
+                                        let _ = ws_stream.close(None).await;
+                                        break;
+                                    }
+                                    Some(Command::SetBackground(false)) => {
+                                        let mut s = state.lock().unwrap();
+                                        s.is_in_background = false;
+                                    }
+                                    Some(Command::Disconnect) => {
+                                        {
+                                            let mut s = state.lock().unwrap();
+                                            s.connection_state = ConnectionStateInternal::Idle;
+                                            s.diagnostics.reconnect_attempt = None;
+                                        }
+                                        let _ = ws_stream.close(None).await;
+                                        break;
+                                    }
+                                    Some(Command::ConnectNow) => {
+                                        // Already connected; ignore.
+                                    }
+                                    None => break,
+                                }
+                            }
+                            msg = ws_stream.next() => {
+                                let msg = match msg {
+                                    Some(m) => m,
+                                    None => break,
+                                };
+                                match msg {
+                                    Ok(WsMessage::Text(txt)) => {
+                                        let event = decode_server_event(txt.as_bytes());
+                                        if let Ok(ev) = event {
+                                            apply_event(&state, &mut ws_stream, ev).await;
+                                        } else {
+                                            // decoding error -> reconnect
+                                            break;
+                                        }
+                                    }
+                                    Ok(WsMessage::Binary(bin)) => {
+                                        let event = decode_server_event(&bin);
+                                        if let Ok(ev) = event {
+                                            apply_event(&state, &mut ws_stream, ev).await;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    Ok(WsMessage::Ping(_)) => {}
+                                    Ok(WsMessage::Pong(_)) => {}
+                                    Ok(WsMessage::Close(_)) => break,
+                                    Err(_) => break,
+                                    _ => {}
+                                }
+                            }
+                        }
+
+                        // Check if background should stop immediately.
+                        if state.lock().unwrap().is_in_background {
+                            break;
+                        }
+                    }
+
+                    if state.lock().unwrap().is_in_background {
+                        break;
+                    }
+
+                    // Reconnect on any socket exit (unless background/disconnect has moved to Idle).
+                    if matches!(state.lock().unwrap().connection_state, ConnectionStateInternal::Idle) {
+                        break;
+                    }
+
+                    if attempt >= max_attempts {
+                        let mut s = state.lock().unwrap();
+                        s.connection_state = ConnectionStateInternal::Failed { reason: "reconnect max attempts".to_string() };
+                        break;
+                    }
+                }
+            }
+            Some(Command::Disconnect) => {
+                let mut s = state.lock().unwrap();
+                s.connection_state = ConnectionStateInternal::Idle;
+            }
+            Some(Command::Input(_)) | Some(Command::Heartbeat) => {
+                // Ignore outgoing while disconnected.
+            }
+            Some(Command::SetBackground(bg)) => {
+                let mut s = state.lock().unwrap();
+                s.is_in_background = bg;
+                if bg {
+                    s.connection_state = ConnectionStateInternal::Idle;
+                }
+            }
+            None => break,
+        }
+    }
+}
+
+async fn apply_event(
+    state: &Arc<Mutex<SessionStateInternal>>,
+    ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    event: DCSSServerEvent,
+) {
+    let event_type_str = match &event {
+        DCSSServerEvent::Hello { .. } => "hello",
+        DCSSServerEvent::GameFrame { .. } => "frame",
+        DCSSServerEvent::Message { .. } => "message",
+        DCSSServerEvent::HeartbeatAck => "heartbeat_ack",
+        DCSSServerEvent::HeartbeatRequest => "heartbeat",
+        DCSSServerEvent::Error { .. } => "error",
+        DCSSServerEvent::Unknown { type_name } => type_name.as_str(),
+    }
+    .to_string();
+
+    {
+        let mut s = state.lock().unwrap();
+        s.diagnostics.last_event_type = Some(event_type_str);
+    }
+
+    match event {
+        DCSSServerEvent::Hello { .. } => {}
+        DCSSServerEvent::GameFrame { grid, status_line } => {
+            let mut s = state.lock().unwrap();
+            s.game_state.grid = grid;
+            s.game_state.status_line = status_line;
+        }
+        DCSSServerEvent::Message { text } => {
+            let mut s = state.lock().unwrap();
+            s.game_state.last_message = text;
+        }
+        DCSSServerEvent::HeartbeatAck => {}
+        DCSSServerEvent::HeartbeatRequest => {
+            // Server asked us to send a heartbeat.
+            let payload = encode_client_command_wire(DCSSClientCommand::Heartbeat);
+            let _ = ws_stream.send(Message::Ping(vec![])).await;
+            let _ = ws_stream
+                .send(Message::Text(String::from_utf8_lossy(&payload).to_string()))
+                .await;
+        }
+        DCSSServerEvent::Error { text, .. } => {
+            let mut s = state.lock().unwrap();
+            s.diagnostics.last_error = Some(text.clone());
+            s.game_state.last_message = text;
+        }
+        DCSSServerEvent::Unknown { type_name } => {
+            let mut s = state.lock().unwrap();
+            s.game_state.last_message = format!("Unknown event: {type_name}");
+        }
+    }
+}
+
+// ===== C ABI =====
+
+#[repr(C)]
+pub struct DCSSSession {
+    inner: Session,
+}
+
+fn cstr_to_string<'a>(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string()) }
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_session_create() -> *mut DCSSSession {
+    let session = DCSSSession {
+        inner: Session::new(),
+    };
+    Box::into_raw(Box::new(session))
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_session_destroy(handle: *mut DCSSSession) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(handle));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_session_connect(
+    handle: *mut DCSSSession,
+    url: *const c_char,
+    client_version: *const c_char,
+) {
+    if handle.is_null() || url.is_null() {
+        return;
+    }
+
+    let session = unsafe { &(*handle).inner };
+    let url_s = cstr_to_string(url).unwrap_or_default();
+    let client_s = cstr_to_string(client_version).unwrap_or_else(|| "dcss-ios-0.1".to_string());
+
+    {
+        let mut s = session.state.lock().unwrap();
+        s.endpoint = Some(url_s);
+        s.client_version = client_s;
+        s.is_in_background = false;
+        s.connection_state = ConnectionStateInternal::Connecting;
+        s.diagnostics.last_error = None;
+        s.diagnostics.reconnect_attempt = None;
+    }
+
+    session.ensure_loop_started();
+
+    if let Some(tx) = session.cmd_tx.lock().unwrap().as_ref() {
+        let _ = tx.try_send(Command::ConnectNow);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_session_disconnect(handle: *mut DCSSSession) {
+    if handle.is_null() {
+        return;
+    }
+    let session = unsafe { &(*handle).inner };
+    {
+        let mut s = session.state.lock().unwrap();
+        s.connection_state = ConnectionStateInternal::Idle;
+    }
+    if let Some(tx) = session.cmd_tx.lock().unwrap().as_ref() {
+        let _ = tx.try_send(Command::Disconnect);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_session_send_input(handle: *mut DCSSSession, command: *const c_char) {
+    if handle.is_null() || command.is_null() {
+        return;
+    }
+    let session = unsafe { &(*handle).inner };
+    let cmd_s = cstr_to_string(command).unwrap_or_default();
+    if let Some(tx) = session.cmd_tx.lock().unwrap().as_ref() {
+        let _ = tx.try_send(Command::Input(cmd_s));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_session_send_heartbeat(handle: *mut DCSSSession) {
+    if handle.is_null() {
+        return;
+    }
+    let session = unsafe { &(*handle).inner };
+    if let Some(tx) = session.cmd_tx.lock().unwrap().as_ref() {
+        let _ = tx.try_send(Command::Heartbeat);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_session_app_did_enter_background(handle: *mut DCSSSession) {
+    if handle.is_null() {
+        return;
+    }
+    let session = unsafe { &(*handle).inner };
+    {
+        let mut s = session.state.lock().unwrap();
+        s.is_in_background = true;
+        s.connection_state = ConnectionStateInternal::Idle;
+    }
+    if let Some(tx) = session.cmd_tx.lock().unwrap().as_ref() {
+        let _ = tx.try_send(Command::SetBackground(true));
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_session_app_will_enter_foreground(handle: *mut DCSSSession) {
+    if handle.is_null() {
+        return;
+    }
+    let session = unsafe { &(*handle).inner };
+    {
+        let mut s = session.state.lock().unwrap();
+        s.is_in_background = false;
+    }
+    session.ensure_loop_started();
+    if let Some(tx) = session.cmd_tx.lock().unwrap().as_ref() {
+        let _ = tx.try_send(Command::SetBackground(false));
+        let _ = tx.try_send(Command::ConnectNow);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_session_get_snapshot_json(handle: *mut DCSSSession) -> *mut c_char {
+    if handle.is_null() {
+        return std::ptr::null_mut();
+    }
+    let session = unsafe { &(*handle).inner };
+    let json = session.snapshot_json();
+    CString::new(json).unwrap().into_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn dcss_free_string(s: *mut c_char) {
+    if s.is_null() {
+        return;
+    }
+    unsafe {
+        drop(CString::from_raw(s));
+    }
+}
+
+// Silence warnings for unused imports in this minimal snapshot implementation.
+#[allow(dead_code)]
+fn _unused() {
+    let _ = free as usize;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = match name {
+            "hello" => "../Tests/DCSSCoreTests/Fixtures/hello.json",
+            "frame" => "../Tests/DCSSCoreTests/Fixtures/frame.json",
+            _ => panic!("unknown fixture"),
+        };
+        std::fs::read(path).expect("read fixture json")
+    }
+
+    #[test]
+    fn decode_hello_fixture() {
+        let data = fixture("hello");
+        let event = decode_server_event(&data).expect("decode");
+        match event {
+            DCSSServerEvent::Hello { server_version } => assert_eq!(server_version, "0.32-webtiles"),
+            _ => panic!("expected hello"),
+        }
+    }
+
+    #[test]
+    fn decode_frame_fixture() {
+        let data = fixture("frame");
+        let event = decode_server_event(&data).expect("decode");
+        match event {
+            DCSSServerEvent::GameFrame { grid, status_line } => {
+                assert_eq!(grid, vec!["##########", "#..@.....#", "##########"]);
+                assert_eq!(status_line, "HP 24/24 MP 3/3");
+            }
+            _ => panic!("expected frame"),
+        }
+    }
+
+    #[test]
+    fn decode_flattened_message_format() {
+        let data = br#"{"msg":"msg","message":"You feel healthy."}"#;
+        let event = decode_server_event(data).expect("decode");
+        match event {
+            DCSSServerEvent::Message { text } => assert_eq!(text, "You feel healthy."),
+            _ => panic!("expected message"),
+        }
+    }
+
+    #[test]
+    fn encode_input_command() {
+        let payload = encode_client_command_wire(DCSSClientCommand::Input { command: "o".to_string() });
+        let v: Value = serde_json::from_slice(&payload).expect("json parse");
+        assert_eq!(v["type"], "input");
+        assert_eq!(v["payload"]["command"], "o");
+    }
+}
+

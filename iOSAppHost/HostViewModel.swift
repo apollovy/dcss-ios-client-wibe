@@ -1,4 +1,5 @@
 import DCSSCore
+import DCSSCoreFFI
 import Foundation
 import Observation
 
@@ -17,14 +18,14 @@ final class HostViewModel {
     var debugLastError = "-"
 
     private let settings: SettingsStore
-    private let session: SessionActor
+    private nonisolated let session: any SessionClient
 
     init(
         settings: SettingsStore = UserDefaultsSettingsStore(),
-        session: SessionActor = SessionActor(transport: WebSocketTransport())
+        session: (any SessionClient)? = nil
     ) {
         self.settings = settings
-        self.session = session
+        self.session = session ?? RustSessionClient.makeOrNil() ?? SessionActor(transport: WebSocketTransport())
         serverURL = settings.serverURLString
     }
 
@@ -36,7 +37,7 @@ final class HostViewModel {
             return
         }
 
-        await session.connect(url: url)
+        await session.connect(url: url, clientVersion: nil)
         await refresh()
     }
 
