@@ -1,1 +1,1 @@
-{"type":"hello","payload":{"serverVersion":"0.32-webtiles"}}
+{"type":"welcome","payload":{"version":"0.32-webtiles"}}

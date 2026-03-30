@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var vm = GameViewModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         TabView {
@@ -13,6 +14,21 @@ struct ContentView: View {
 
             SettingsView(vm: vm)
                 .tabItem { Label("Settings", systemImage: "gearshape") }
+        }
+        .task {
+            await vm.syncFromSession()
+        }
+        .onChange(of: scenePhase) { _, newValue in
+            Task {
+                switch newValue {
+                case .background:
+                    await vm.appDidEnterBackground()
+                case .active:
+                    await vm.appWillEnterForeground()
+                default:
+                    break
+                }
+            }
         }
     }
 }
@@ -27,6 +43,13 @@ private struct ConnectView: View {
                     .autocorrectionDisabled()
                 Text("Status: \(vm.connectionStatus)")
                 Text("Message: \(vm.lastMessage)")
+
+                Section("Diagnostics") {
+                    Text("Last event: \(vm.debugLastEvent)")
+                    Text("Reconnect attempt: \(vm.debugReconnectAttempt)")
+                    Text("Last error: \(vm.debugLastError)")
+                    Text("Last connected at: \(vm.debugLastConnectedAt)")
+                }
 
                 HStack {
                     Button("Connect") {
@@ -81,6 +104,15 @@ private struct GameScreenView: View {
                     Task { await vm.heartbeat() }
                 }
                 .buttonStyle(.bordered)
+
+                GroupBox("Live debug") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("State: \(vm.connectionStatus)")
+                        Text("Last event: \(vm.debugLastEvent)")
+                        Text("Last error: \(vm.debugLastError)")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             .padding()
             .navigationTitle("Game")

@@ -1,6 +1,6 @@
-# DCSS WebSocket Protocol Contract (MVP)
+# DCSS WebSocket Protocol Contract (Playable MVP)
 
-This document captures the app-side protocol contract used by this project.
+This document captures the app-side wire contract for a playable iPhone build.
 
 ## Outgoing commands
 
@@ -11,26 +11,42 @@ This document captures the app-side protocol contract used by this project.
 - `heartbeat`
   - payload: empty
 
-## Incoming events
+## Incoming events (supported aliases)
 
-- `hello`
-  - payload: `serverVersion`
-- `frame`
-  - payload: `grid` (newline-separated rows), `statusLine`
-- `message`
-  - payload: `text`
-- `heartbeat_ack`
-  - payload: empty
+- `hello` or `welcome`
+  - payload: `serverVersion` or `version`
+- `frame` or `update`
+  - payload variants:
+    - `grid` (newline-separated rows) + `statusLine`
+    - `gridRows` (array of strings) + `status`
+- `message` or `msg`
+  - payload: `text` or `message`
+- `heartbeat_ack` or `pong`
+- `heartbeat` or `ping`
 - `error`
-  - payload: `code`, `text`
+  - payload: `code`, `text`/`message`
 
-## Error and reconnect semantics
+## Compatibility mode
 
-- Decode/parsing errors set session state to `failed`.
+If endpoint sends flattened JSON (without `{ type, payload }` envelope), codec falls back to:
+
+- `type` from `type` field, or from `msg` field
+- payload from the whole event object
+
+## Reconnect and lifecycle semantics
+
 - Socket read/send failures trigger reconnect with exponential backoff.
-- Reconnect attempts are capped by policy (`maxAttempts`).
+- Reconnect attempts are capped by `ReconnectPolicy.maxAttempts`.
+- On app background:
+  - receive loop is cancelled
+  - socket is disconnected
+  - connected state transitions to `idle`
+- On app foreground:
+  - actor reconnects using last successful endpoint
 
-## Background/foreground behavior
+## Diagnostics exported by SessionActor
 
-- In MVP, app keeps explicit connect/disconnect controls.
-- Next step: automatic suspend/resume hooks via scene phase transitions.
+- `lastEventType`
+- `reconnectAttempt`
+- `lastError`
+- `lastConnectedAt`

@@ -22,12 +22,19 @@ final class ProtocolCodecTests: XCTestCase {
         )
     }
 
+    func testDecodeFlattenedMessageFormat() throws {
+        let data = Data("{\"msg\":\"msg\",\"message\":\"You feel healthy.\"}".utf8)
+        let event = try codec.decode(data: data)
+
+        XCTAssertEqual(event, .message(text: "You feel healthy."))
+    }
+
     func testEncodeInputCommand() throws {
         let data = try codec.encode(command: .input(command: "o"))
         let envelope = try JSONDecoder().decode(DCSSWireEnvelope.self, from: data)
 
         XCTAssertEqual(envelope.type, "input")
-        XCTAssertEqual(envelope.payload["command"], "o")
+        XCTAssertEqual(envelope.payload["command"], .string("o"))
     }
 
     private func fixture(named: String) throws -> Data {

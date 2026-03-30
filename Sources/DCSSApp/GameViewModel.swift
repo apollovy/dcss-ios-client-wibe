@@ -13,6 +13,11 @@ final class GameViewModel {
     var commandInput = ""
     var fontScale = 1.0
 
+    var debugLastEvent = "-"
+    var debugReconnectAttempt = "-"
+    var debugLastError = "-"
+    var debugLastConnectedAt = "-"
+
     private let settings: SettingsStore
     private let session: SessionActor
 
@@ -27,6 +32,7 @@ final class GameViewModel {
         settings.serverURLString = serverURL
         guard let url = URL(string: serverURL) else {
             connectionStatus = "invalid url"
+            debugLastError = "Invalid URL"
             return
         }
 
@@ -40,7 +46,7 @@ final class GameViewModel {
     }
 
     func sendCommand() async {
-        let command = commandInput
+        let command = commandInput.trimmingCharacters(in: .whitespacesAndNewlines)
         commandInput = ""
         await session.sendInput(command)
         await syncFromSession()
@@ -48,6 +54,16 @@ final class GameViewModel {
 
     func heartbeat() async {
         await session.sendHeartbeat()
+        await syncFromSession()
+    }
+
+    func appDidEnterBackground() async {
+        await session.appDidEnterBackground()
+        await syncFromSession()
+    }
+
+    func appWillEnterForeground() async {
+        await session.appWillEnterForeground()
         await syncFromSession()
     }
 
@@ -64,5 +80,16 @@ final class GameViewModel {
         grid = game.grid
         statusLine = game.statusLine
         lastMessage = game.lastMessage
+
+        let diagnostics = snapshot.2
+        debugLastEvent = diagnostics.lastEventType ?? "-"
+        debugReconnectAttempt = diagnostics.reconnectAttempt.map(String.init) ?? "-"
+        debugLastError = diagnostics.lastError ?? "-"
+        if let date = diagnostics.lastConnectedAt {
+            let formatter = ISO8601DateFormatter()
+            debugLastConnectedAt = formatter.string(from: date)
+        } else {
+            debugLastConnectedAt = "-"
+        }
     }
 }

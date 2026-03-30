@@ -36,4 +36,18 @@ final class SessionActorTests: XCTestCase {
             XCTFail("Expected reconnect flow, got \(state)")
         }
     }
+
+    func testBackgroundStopsSessionAndForegroundReconnects() async throws {
+        let transport = MockWebSocketTransport()
+        let session = SessionActor(transport: transport)
+
+        await session.connect(url: URL(string: "wss://example.com/socket")!)
+        await session.appDidEnterBackground()
+        let idleState = await session.connectionState
+        XCTAssertEqual(idleState, .idle)
+
+        await session.appWillEnterForeground()
+        let connectCount = await transport.connectCount
+        XCTAssertGreaterThanOrEqual(connectCount, 2)
+    }
 }

@@ -1,1 +1,1 @@
-{"type":"frame","payload":{"grid":"##########\\n#..@.....#\\n##########","statusLine":"HP 24/24 MP 3/3"}}
+{"type":"update","payload":{"gridRows":["##########","#..@.....#","##########"],"status":"HP 24/24 MP 3/3"}}
