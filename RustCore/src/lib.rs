@@ -8,7 +8,6 @@ use std::time::{Duration, SystemTime};
 use chrono::Utc;
 use flate2::{Decompress, FlushDecompress};
 use futures_util::{SinkExt, StreamExt};
-use libc::free;
 use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib};
 use serde::{Deserialize, Serialize};
 use serde_json::de::Deserializer;
@@ -231,13 +230,20 @@ fn decode_server_value_as_events(value: Value) -> Result<Vec<DCSSServerEvent>, P
 fn decode_server_event_binary(data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
     // 1) Try as plain UTF-8 JSON first.
     if let Ok(events) = decode_server_events(data) {
+        if let Ok(text) = std::str::from_utf8(data) {
+            println!("[RustCore] binary payload decoded as plain utf8 len={}", data.len());
+            println!("[RustCore] inflated text preview={text}");
+        }
         return Ok(events);
     }
 
     // 2) Try zlib-wrapped DEFLATE (common pako/default case).
     if let Ok(inflated) = decompress_to_vec_zlib(data) {
         if let Ok(events) = decode_server_events(&inflated) {
-            println!("[RustCore] binary payload decoded via zlib inflate");
+            println!("[RustCore] binary payload decoded via zlib inflate len={}", inflated.len());
+            if let Ok(text) = std::str::from_utf8(&inflated) {
+                println!("[RustCore] inflated text preview={text}");
+            }
             return Ok(events);
         }
     }
@@ -245,7 +251,10 @@ fn decode_server_event_binary(data: &[u8]) -> Result<Vec<DCSSServerEvent>, Proto
     // 3) Try raw DEFLATE (pako inflateRaw case).
     if let Ok(inflated) = decompress_to_vec(data) {
         if let Ok(events) = decode_server_events(&inflated) {
-            println!("[RustCore] binary payload decoded via raw deflate");
+            println!("[RustCore] binary payload decoded via raw deflate len={}", inflated.len());
+            if let Ok(text) = std::str::from_utf8(&inflated) {
+                println!("[RustCore] inflated text preview={text}");
+            }
             return Ok(events);
         }
     }
@@ -282,28 +291,49 @@ impl StatefulBinaryInflater {
         }
     }
 
-    fn inflate_bytes(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
-        // RFC7692/permessage-deflate messages are usually terminated with Z_SYNC_FLUSH marker.
-        // To inflate each WS frame while keeping context takeover, append trailer then keep inflater state.
+    fn decode_events(&mut self, data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+        // Per-frame inflate: each websocket binary message is expected to contain one full JSON payload.
         let mut input = Vec::with_capacity(data.len() + 4);
         input.extend_from_slice(data);
+        // pako-compatible trailer for per-message Z_SYNC_FLUSH blocks.
         input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
 
-        let mut out = Vec::with_capacity(data.len() * 4 + 64);
+        let mut inflated = Vec::with_capacity(data.len() * 4 + 64);
         self.raw
-            .decompress_vec(&input, &mut out, FlushDecompress::Sync)
-            .map_err(|e| format!("stateful raw inflate failed: {e}"))?;
-        Ok(out)
-    }
+            .decompress_vec(&input, &mut inflated, FlushDecompress::None)
+            .map_err(|e| ProtocolCodecError::MalformedPayload(format!("stateful raw inflate failed: {e}")))?;
 
-    fn decode_events(&mut self, data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
-        let inflated = self
-            .inflate_bytes(data)
-            .map_err(ProtocolCodecError::MalformedPayload)?;
         println!(
             "[RustCore] binary payload decoded via stateful deflate len={}",
             inflated.len()
         );
+        // let nul_positions: Vec<usize> = inflated
+        //     .iter()
+        //     .enumerate()
+        //     .filter_map(|(i, b)| if *b == 0 { Some(i) } else { None })
+        //     .take(8)
+        //     .collect();
+        // if !nul_positions.is_empty() {
+        //     let first = nul_positions[0];
+        //     let start = first.saturating_sub(12);
+        //     let end = (first + 12).min(inflated.len());
+        //     let around = inflated[start..end]
+        //         .iter()
+        //         .map(|b| format!("{:02x}", b))
+        //         .collect::<Vec<_>>()
+        //         .join(" ");
+        //     println!(
+        //         "[RustCore] inflated contains NUL bytes count={} first_positions={:?} around_first_nul={}",
+        //         inflated.iter().filter(|b| **b == 0).count(),
+        //         nul_positions,
+        //         around
+        //     );
+        //     inflated.retain(|b| *b != 0);
+        // println!(
+        //     "[RustCore] binary payload after removing NUL bytes via stateful deflate len={}",
+        //     inflated.len()
+        // );
+        // }
         if let Ok(text) = std::str::from_utf8(&inflated) {
             println!("[RustCore] inflated text preview={text}");
         } else {
@@ -342,6 +372,10 @@ impl StatefulBinaryInflater {
 
         if consumed > 0 {
             self.pending_json.drain(..consumed);
+            println!("[RustCore] pending json after draining consumed bytes len={}", self.pending_json.len());
+        }
+        else {
+            println!("[RustCore] no bytes consumed, pending json = {}", String::from_utf8_lossy(&self.pending_json));
         }
 
         let mut events = Vec::new();
@@ -723,7 +757,6 @@ async fn run_event_loop(
                         s.diagnostics.reconnect_attempt = None;
                     }
                     println!("[RustCore] connect attempt={attempt} success");
-
                     let mut binary_inflater = StatefulBinaryInflater::new();
 
                     // Connected loop
@@ -818,7 +851,7 @@ async fn run_event_loop(
                                             Ok(decoded) => Ok(decoded),
                                             Err(err) => {
                                                 println!("[RustCore] stateful inflater miss: {:?}", err);
-                                                decode_server_event_binary(&bin)
+                                                Err(err)
                                             }
                                         };
                                         match event {
@@ -1122,12 +1155,6 @@ pub extern "C" fn dcss_free_string(s: *mut c_char) {
     }
 }
 
-// Silence warnings for unused imports in this minimal snapshot implementation.
-#[allow(dead_code)]
-fn _unused() {
-    let _ = free as usize;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,6 +1207,109 @@ mod tests {
         let v: Value = serde_json::from_slice(&payload).expect("json parse");
         assert_eq!(v["type"], "input");
         assert_eq!(v["payload"]["command"], "o");
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        s.split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).expect("valid hex byte"))
+            .collect()
+    }
+
+    #[test]
+    fn decode_msgs_envelope_payload() {
+        let payload = br#"{"msgs":[{"msg":"ping"},{"msg":"lobby_entry","username":"Broken26"}]}"#;
+        let events = decode_server_events(payload).expect("decode msgs envelope");
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            DCSSServerEvent::HeartbeatRequest => {}
+            _ => panic!("expected heartbeat request"),
+        }
+        match &events[1] {
+            DCSSServerEvent::Unknown { type_name } => assert_eq!(type_name, "lobby_entry"),
+            _ => panic!("expected lobby_entry as unknown"),
+        }
+    }
+
+    #[test]
+    fn logged_binary_sequence_reproduces_current_parse_failure() {
+        // Frames from device logs (stateful inflater path).
+        let chunk1 = hex_to_bytes("c2 16 2c 83 ab 91 6c 6e 88 dc 48 36 41 ee 2f d0 ae 91 1c 5b 0b 00");
+        let chunk2 = hex_to_bytes("1a 12 e9 c5 d2 14 2d bd 58 d0 36 bd 0c d6 ae 94 b1 81 81 39 4a 2a b1 a4");
+
+        let mut inflater = StatefulBinaryInflater::new();
+
+        let err1 = inflater.decode_events(&chunk1).expect_err("first chunk currently fails to parse");
+        assert!(
+            matches!(err1, ProtocolCodecError::MalformedPayload(ref m) if m.contains("expected value") || m.contains("no complete events yet")),
+            "unexpected first error: {:?}",
+            err1
+        );
+
+        let err2 = inflater.decode_events(&chunk2).expect_err("second chunk currently reproduces parse issue");
+        assert!(
+            matches!(err2, ProtocolCodecError::MalformedPayload(_)),
+            "unexpected second error: {:?}",
+            err2
+        );
+    }
+
+    #[test]
+    #[ignore = "network integration test; run explicitly"]
+    fn live_websocket_receives_messages_from_cao() {
+        ensure_rustls_crypto_provider();
+        let rt = Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            use tokio::time::timeout;
+
+            let (mut ws_stream, response) = timeout(
+                Duration::from_secs(15),
+                connect_async("wss://crawl.akrasiac.org:8443/socket"),
+            )
+            .await
+            .expect("connect timeout")
+            .expect("connect failed");
+
+            assert_eq!(response.status().as_u16(), 101, "expected websocket upgrade");
+
+            let mut inflator = StatefulBinaryInflater::new();
+            for _ in 0..12 {
+                let next_msg = timeout(Duration::from_secs(10), ws_stream.next())
+                    .await
+                    .expect("receive timeout");
+                match next_msg {
+                    Some(Ok(WsMessage::Text(t))) => {
+                        println!("[live-test] text frame len={}", t.len());
+                        if let Ok(events) = decode_server_events(t.as_bytes()) {
+                            for ev in events {
+                                println!("[live-test] decoded text event: {:?}", ev);
+                            }
+                        }
+                        else {
+                            panic!("decode text failed");
+                        }
+                    }
+                    Some(Ok(WsMessage::Binary(b))) => {
+                        println!("[live-test] binary frame len={}", b.len());
+                        if let Ok(events) = inflator.decode_events(&b) {
+                            for ev in events {
+                                println!("[live-test] decoded binary event: {:?}", ev);
+                            }
+                        }
+                        else {
+                            println!("[live-test] decode binary failed");
+                        }
+                    }
+                    Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => {}
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        panic!("socket closed before receiving enough frames: {:?}", frame);
+                    }
+                    Some(Err(e)) => panic!("socket receive error: {e}"),
+                    None => panic!("socket ended before receiving enough frames"),
+                    _ => {}
+                }
+            }
+            let _ = ws_stream.close(None).await;
+        });
     }
 }
 
