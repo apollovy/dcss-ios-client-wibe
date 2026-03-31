@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
-use flate2::{Decompress, FlushDecompress};
+use flate2::{Decompress, FlushDecompress, Status};
 use futures_util::{SinkExt, StreamExt};
 use miniz_oxide::inflate::{decompress_to_vec, decompress_to_vec_zlib};
 use serde::{Deserialize, Serialize};
@@ -298,42 +298,43 @@ impl StatefulBinaryInflater {
         // pako-compatible trailer for per-message Z_SYNC_FLUSH blocks.
         input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
 
-        let mut inflated = Vec::with_capacity(data.len() * 4 + 64);
-        self.raw
-            .decompress_vec(&input, &mut inflated, FlushDecompress::None)
-            .map_err(|e| ProtocolCodecError::MalformedPayload(format!("stateful raw inflate failed: {e}")))?;
+        let mut inflated = Vec::new();
+        let mut input_pos: usize = 0;
+
+        loop {
+            let out_start = inflated.len();
+            inflated.resize(out_start + 8192, 0);
+
+            let before_in = self.raw.total_in();
+            let before_out = self.raw.total_out();
+
+            let status = self.raw
+                .decompress(
+                    &input[input_pos..],
+                    &mut inflated[out_start..],
+                    FlushDecompress::Sync,
+                )
+                .map_err(|e| ProtocolCodecError::MalformedPayload(
+                    format!("stateful raw inflate failed: {e}"),
+                ))?;
+
+            let consumed = (self.raw.total_in() - before_in) as usize;
+            let produced = (self.raw.total_out() - before_out) as usize;
+            input_pos += consumed;
+            inflated.truncate(out_start + produced);
+
+            if status == Status::StreamEnd || input_pos >= input.len() {
+                break;
+            }
+            if consumed == 0 && produced == 0 {
+                break;
+            }
+        }
 
         println!(
             "[RustCore] binary payload decoded via stateful deflate len={}",
             inflated.len()
         );
-        // let nul_positions: Vec<usize> = inflated
-        //     .iter()
-        //     .enumerate()
-        //     .filter_map(|(i, b)| if *b == 0 { Some(i) } else { None })
-        //     .take(8)
-        //     .collect();
-        // if !nul_positions.is_empty() {
-        //     let first = nul_positions[0];
-        //     let start = first.saturating_sub(12);
-        //     let end = (first + 12).min(inflated.len());
-        //     let around = inflated[start..end]
-        //         .iter()
-        //         .map(|b| format!("{:02x}", b))
-        //         .collect::<Vec<_>>()
-        //         .join(" ");
-        //     println!(
-        //         "[RustCore] inflated contains NUL bytes count={} first_positions={:?} around_first_nul={}",
-        //         inflated.iter().filter(|b| **b == 0).count(),
-        //         nul_positions,
-        //         around
-        //     );
-        //     inflated.retain(|b| *b != 0);
-        // println!(
-        //     "[RustCore] binary payload after removing NUL bytes via stateful deflate len={}",
-        //     inflated.len()
-        // );
-        // }
         if let Ok(text) = std::str::from_utf8(&inflated) {
             println!("[RustCore] inflated text preview={text}");
         } else {
