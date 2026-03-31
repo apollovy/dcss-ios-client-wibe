@@ -27,6 +27,43 @@ fn ensure_rustls_crypto_provider() {
     });
 }
 
+#[cfg(debug_assertions)]
+use log::{LevelFilter, Log, Metadata, Record};
+
+#[cfg(debug_assertions)]
+struct RustCoreLogger;
+
+#[cfg(debug_assertions)]
+impl Log for RustCoreLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= LevelFilter::Debug
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            println!("{}", record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+#[cfg(debug_assertions)]
+static RUST_CORE_LOGGER: RustCoreLogger = RustCoreLogger;
+#[cfg(debug_assertions)]
+static LOG_INIT: Once = Once::new();
+
+#[cfg(debug_assertions)]
+fn ensure_rust_core_log() {
+    LOG_INIT.call_once(|| {
+        let _ = log::set_logger(&RUST_CORE_LOGGER).map(|()| log::set_max_level(LevelFilter::Debug));
+    });
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+fn ensure_rust_core_log() {}
+
 // ===== Protocol layer (compatible with the current Swift MVP) =====
 
 #[derive(Debug, Clone)]
@@ -111,6 +148,7 @@ fn decode_server_event(data: &[u8]) -> Result<DCSSServerEvent, ProtocolCodecErro
 }
 
 fn decode_server_events(data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+    ensure_rust_core_log();
     let s = std::str::from_utf8(data).map_err(|_| ProtocolCodecError::InvalidUtf8)?;
     let mut events = Vec::new();
     let stream = Deserializer::from_str(s).into_iter::<Value>();
@@ -183,7 +221,7 @@ fn decode_server_value_as_events(value: Value) -> Result<Vec<DCSSServerEvent>, P
                             type_name: other.to_string(),
                         },
                     };
-                    println!("[RustCore] decoded msg type={msg_type}");
+                    log::debug!("[RustCore] decoded msg type={msg_type}");
                     events.push(ev);
                 }
             }
@@ -216,7 +254,7 @@ fn decode_server_value_as_events(value: Value) -> Result<Vec<DCSSServerEvent>, P
                         type_name: other.to_string(),
                     },
                 };
-                println!("[RustCore] decoded msg type={msg_type}");
+                log::debug!("[RustCore] decoded msg type={msg_type}");
                 events.push(ev);
             }
         }
@@ -231,8 +269,8 @@ fn decode_server_event_binary(data: &[u8]) -> Result<Vec<DCSSServerEvent>, Proto
     // 1) Try as plain UTF-8 JSON first.
     if let Ok(events) = decode_server_events(data) {
         if let Ok(text) = std::str::from_utf8(data) {
-            println!("[RustCore] binary payload decoded as plain utf8 len={}", data.len());
-            println!("[RustCore] inflated text preview={text}");
+            log::debug!("[RustCore] binary payload decoded as plain utf8 len={}", data.len());
+            log::debug!("[RustCore] inflated text preview={text}");
         }
         return Ok(events);
     }
@@ -240,9 +278,9 @@ fn decode_server_event_binary(data: &[u8]) -> Result<Vec<DCSSServerEvent>, Proto
     // 2) Try zlib-wrapped DEFLATE (common pako/default case).
     if let Ok(inflated) = decompress_to_vec_zlib(data) {
         if let Ok(events) = decode_server_events(&inflated) {
-            println!("[RustCore] binary payload decoded via zlib inflate len={}", inflated.len());
+            log::debug!("[RustCore] binary payload decoded via zlib inflate len={}", inflated.len());
             if let Ok(text) = std::str::from_utf8(&inflated) {
-                println!("[RustCore] inflated text preview={text}");
+                log::debug!("[RustCore] inflated text preview={text}");
             }
             return Ok(events);
         }
@@ -251,9 +289,9 @@ fn decode_server_event_binary(data: &[u8]) -> Result<Vec<DCSSServerEvent>, Proto
     // 3) Try raw DEFLATE (pako inflateRaw case).
     if let Ok(inflated) = decompress_to_vec(data) {
         if let Ok(events) = decode_server_events(&inflated) {
-            println!("[RustCore] binary payload decoded via raw deflate len={}", inflated.len());
+            log::debug!("[RustCore] binary payload decoded via raw deflate len={}", inflated.len());
             if let Ok(text) = std::str::from_utf8(&inflated) {
-                println!("[RustCore] inflated text preview={text}");
+                log::debug!("[RustCore] inflated text preview={text}");
             }
             return Ok(events);
         }
@@ -279,7 +317,6 @@ fn is_ignorable_decode_error(err: &ProtocolCodecError) -> bool {
 
 struct StatefulBinaryInflater {
     raw: Decompress,
-    pending_json: Vec<u8>,
 }
 
 impl StatefulBinaryInflater {
@@ -287,11 +324,11 @@ impl StatefulBinaryInflater {
         // false => raw DEFLATE stream (no zlib/gzip header), matches permessage-deflate payloads.
         Self {
             raw: Decompress::new(false),
-            pending_json: Vec::new(),
         }
     }
 
     fn decode_events(&mut self, data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+        ensure_rust_core_log();
         // Per-frame inflate: each websocket binary message is expected to contain one full JSON payload.
         let mut input = Vec::with_capacity(data.len() + 4);
         input.extend_from_slice(data);
@@ -323,73 +360,26 @@ impl StatefulBinaryInflater {
             input_pos += consumed;
             inflated.truncate(out_start + produced);
 
-            if status == Status::StreamEnd || input_pos >= input.len() {
-                break;
-            }
             if consumed == 0 && produced == 0 {
                 break;
             }
         }
 
-        println!(
+        log::debug!(
             "[RustCore] binary payload decoded via stateful deflate len={}",
             inflated.len()
         );
         if let Ok(text) = std::str::from_utf8(&inflated) {
-            println!("[RustCore] inflated text preview={text}");
+            log::debug!("[RustCore] inflated text preview={text}");
         } else {
-            println!("[RustCore] inflated bytes are not valid UTF-8");
-        }
-        self.pending_json.extend_from_slice(&inflated);
-
-        let mut parsed_values: Vec<Value> = Vec::new();
-        let mut consumed: usize = 0;
-        let mut eof_in_tail = false;
-
-        let mut iter = Deserializer::from_slice(&self.pending_json).into_iter::<Value>();
-        loop {
-            match iter.next() {
-                Some(Ok(value)) => {
-                    parsed_values.push(value);
-                    consumed = iter.byte_offset();
-                }
-                Some(Err(err)) => {
-                    consumed = iter.byte_offset();
-                    if err.is_eof() {
-                        eof_in_tail = true;
-                    } else {
-                        return Err(ProtocolCodecError::MalformedPayload(format!(
-                            "invalid json stream: {err}"
-                        )));
-                    }
-                    break;
-                }
-                None => {
-                    consumed = iter.byte_offset();
-                    break;
-                }
-            }
-        }
-
-        if consumed > 0 {
-            self.pending_json.drain(..consumed);
-            println!("[RustCore] pending json after draining consumed bytes len={}", self.pending_json.len());
-        }
-        else {
-            println!("[RustCore] no bytes consumed, pending json = {}", String::from_utf8_lossy(&self.pending_json));
+            log::debug!("[RustCore] inflated bytes are not valid UTF-8");
         }
 
         let mut events = Vec::new();
-        for value in parsed_values {
+        for value in Deserializer::from_slice(&inflated).into_iter::<Value>() {
+            let value = value.map_err(|e| ProtocolCodecError::MalformedPayload(format!("invalid json stream: {e}")))?;
             events.extend(decode_server_value_as_events(value)?);
         }
-
-        if events.is_empty() && eof_in_tail {
-            return Err(ProtocolCodecError::MalformedPayload(
-                "json stream produced no complete events yet".to_string(),
-            ));
-        }
-
         Ok(events)
     }
 }
@@ -649,26 +639,27 @@ async fn run_event_loop(
     state: Arc<Mutex<SessionStateInternal>>,
     mut cmd_rx: mpsc::Receiver<Command>,
 ) {
-    println!("[RustCore] event loop started");
+    ensure_rust_core_log();
+    log::debug!("[RustCore] event loop started");
     loop {
         // Wait for a ConnectNow command or for outgoing commands while idle.
         match cmd_rx.recv().await {
             Some(Command::ConnectNow) => {
-                println!("[RustCore] ConnectNow received");
+                log::debug!("[RustCore] ConnectNow received");
                 // Attempt connect loop until disconnect/background.
                 if state.lock().unwrap().is_in_background {
-                    println!("[RustCore] skip connect: app in background");
+                    log::debug!("[RustCore] skip connect: app in background");
                     continue;
                 }
 
                 let endpoint = state.lock().unwrap().endpoint.clone();
                 let client_version = state.lock().unwrap().client_version.clone();
                 if endpoint.is_none() {
-                    println!("[RustCore] skip connect: endpoint missing");
+                    log::debug!("[RustCore] skip connect: endpoint missing");
                     continue;
                 }
                 let endpoint = endpoint.unwrap();
-                println!("[RustCore] connect target={endpoint}");
+                log::debug!("[RustCore] connect target={endpoint}");
 
                 let mut attempt: u32 = 0;
                 let max_attempts: u32 = 5;
@@ -696,14 +687,14 @@ async fn run_event_loop(
                         s.diagnostics.last_error = None;
                     }
 
-                    println!("[RustCore] connect attempt={attempt} start");
+                    log::debug!("[RustCore] connect attempt={attempt} start");
                     let ws_res = timeout(Duration::from_secs(20), connect_async(endpoint.clone())).await;
                     let ws_res = match ws_res {
                         Ok(res) => res,
                         Err(_) => {
                             let mut s = state.lock().unwrap();
                             s.diagnostics.last_error = Some("connect timeout".to_string());
-                            println!("[RustCore] connect attempt={attempt} timeout");
+                            log::debug!("[RustCore] connect attempt={attempt} timeout");
                             if attempt >= max_attempts {
                                 s.connection_state = ConnectionStateInternal::Failed {
                                     reason: "connect timeout".to_string(),
@@ -718,7 +709,7 @@ async fn run_event_loop(
                         Err(e) => {
                             let mut s = state.lock().unwrap();
                             s.diagnostics.last_error = Some(e.to_string());
-                            println!("[RustCore] connect attempt={attempt} failed error={e}");
+                            log::debug!("[RustCore] connect attempt={attempt} failed error={e}");
                             if attempt >= max_attempts {
                                 s.connection_state = ConnectionStateInternal::Failed {
                                     reason: e.to_string(),
@@ -728,7 +719,7 @@ async fn run_event_loop(
                             continue;
                         }
                     };
-                    println!(
+                    log::debug!(
                         "[RustCore] handshake status={} extensions={:?} server={:?}",
                         response.status(),
                         response.headers().get("sec-websocket-extensions"),
@@ -757,7 +748,7 @@ async fn run_event_loop(
                         s.diagnostics.last_connected_at = Some(SystemTime::now());
                         s.diagnostics.reconnect_attempt = None;
                     }
-                    println!("[RustCore] connect attempt={attempt} success");
+                    log::debug!("[RustCore] connect attempt={attempt} success");
                     let mut binary_inflater = StatefulBinaryInflater::new();
 
                     // Connected loop
@@ -816,13 +807,13 @@ async fn run_event_loop(
                                             let mut s = state.lock().unwrap();
                                             s.diagnostics.last_error = Some("socket stream ended (EOF)".to_string());
                                         }
-                                        println!("[RustCore] socket stream ended (EOF)");
+                                        log::debug!("[RustCore] socket stream ended (EOF)");
                                         break;
                                     }
                                 };
                                 match msg {
                                     Ok(WsMessage::Text(txt)) => {
-                                        println!(
+                                        log::debug!(
                                             "[RustCore] recv text len={} sample={}",
                                             txt.len(),
                                             txt.chars().take(180).collect::<String>()
@@ -840,18 +831,18 @@ async fn run_event_loop(
                                                     let mut s = state.lock().unwrap();
                                                     s.diagnostics.last_error = Some(msg.clone());
                                                 }
-                                                println!("[RustCore] {msg}");
+                                                log::debug!("[RustCore] {msg}");
                                                 // Ignore unknown text frames and keep connection alive.
                                                 continue;
                                             }
                                         }
                                     }
                                     Ok(WsMessage::Binary(bin)) => {
-                                        println!("[RustCore] recv binary len={}", bin.len());
+                                        log::debug!("[RustCore] recv binary len={}", bin.len());
                                         let event = match binary_inflater.decode_events(&bin) {
                                             Ok(decoded) => Ok(decoded),
                                             Err(err) => {
-                                                println!("[RustCore] stateful inflater miss: {:?}", err);
+                                                log::debug!("[RustCore] stateful inflater miss: {:?}", err);
                                                 Err(err)
                                             }
                                         };
@@ -873,7 +864,7 @@ async fn run_event_loop(
                                                     let mut s = state.lock().unwrap();
                                                     s.diagnostics.last_error = Some(msg.clone());
                                                 }
-                                                println!("[RustCore] {msg}; hex={hex_preview}");
+                                                log::debug!("[RustCore] {msg}; hex={hex_preview}");
                                                 // Some servers send binary housekeeping frames. Do not reconnect on them.
                                                 continue;
                                             }
@@ -890,7 +881,7 @@ async fn run_event_loop(
                                             let mut s = state.lock().unwrap();
                                             s.diagnostics.last_error = Some(format!("socket closed: {reason}"));
                                         }
-                                        println!("[RustCore] socket closed: {reason}");
+                                        log::debug!("[RustCore] socket closed: {reason}");
                                         break;
                                     }
                                     Err(e) => {
@@ -898,7 +889,7 @@ async fn run_event_loop(
                                             let mut s = state.lock().unwrap();
                                             s.diagnostics.last_error = Some(format!("socket error: {e}"));
                                         }
-                                        println!("[RustCore] websocket read error: {e}");
+                                        log::debug!("[RustCore] websocket read error: {e}");
                                         break;
                                     }
                                     _ => {}
@@ -924,7 +915,7 @@ async fn run_event_loop(
                     if attempt >= max_attempts {
                         let mut s = state.lock().unwrap();
                         s.connection_state = ConnectionStateInternal::Failed { reason: "reconnect max attempts".to_string() };
-                        println!("[RustCore] reconnect max attempts reached");
+                        log::debug!("[RustCore] reconnect max attempts reached");
                         break;
                     }
                 }
@@ -1279,10 +1270,10 @@ mod tests {
                     .expect("receive timeout");
                 match next_msg {
                     Some(Ok(WsMessage::Text(t))) => {
-                        println!("[live-test] text frame len={}", t.len());
+                        log::debug!("[live-test] text frame len={}", t.len());
                         if let Ok(events) = decode_server_events(t.as_bytes()) {
                             for ev in events {
-                                println!("[live-test] decoded text event: {:?}", ev);
+                                log::debug!("[live-test] decoded text event: {:?}", ev);
                             }
                         }
                         else {
@@ -1290,14 +1281,14 @@ mod tests {
                         }
                     }
                     Some(Ok(WsMessage::Binary(b))) => {
-                        println!("[live-test] binary frame len={}", b.len());
+                        log::debug!("[live-test] binary frame len={}", b.len());
                         if let Ok(events) = inflator.decode_events(&b) {
                             for ev in events {
-                                println!("[live-test] decoded binary event: {:?}", ev);
+                                log::debug!("[live-test] decoded binary event: {:?}", ev);
                             }
                         }
                         else {
-                            println!("[live-test] decode binary failed");
+                            panic!("decode binary failed");
                         }
                     }
                     Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => {}

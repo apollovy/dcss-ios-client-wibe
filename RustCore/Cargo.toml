@@ -19,4 +19,5 @@ flate2 = "1.0.35"
 url = "2.5.1"
 chrono = { version = "0.4.38", features = ["serde"] }
 libc = "0.2.153"
+log = { version = "0.4.22", features = ["std", "max_level_debug", "release_max_level_off"] }
 
