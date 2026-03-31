@@ -41,7 +41,7 @@ impl Log for RustCoreLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            println!("{}", record.args());
+            eprintln!("{}", record.args());
         }
     }
 

@@ -22,6 +22,43 @@ export CARGO_TARGET_DIR
 
 cd "${RUST_CORE_DIR}"
 
+# Build profile selection:
+# Priority:
+# 1) RUST_CARGO_PROFILE override ("debug" | "release")
+# 2) Xcode CONFIGURATION mapping
+# 3) Manual shell default -> debug (better local visibility of Rust logs)
+if [[ -n "${RUST_CARGO_PROFILE:-}" ]]; then
+  case "${RUST_CARGO_PROFILE}" in
+    debug|release)
+      CARGO_PROFILE="${RUST_CARGO_PROFILE}"
+      ;;
+    *)
+      echo "error: unsupported RUST_CARGO_PROFILE='${RUST_CARGO_PROFILE}', use 'debug' or 'release'" >&2
+      exit 1
+      ;;
+  esac
+  XCODE_CONFIGURATION="${CONFIGURATION:-manual}"
+elif [[ -n "${CONFIGURATION:-}" ]]; then
+  XCODE_CONFIGURATION="${CONFIGURATION}"
+  if [[ "${XCODE_CONFIGURATION}" =~ [Dd]ebug ]]; then
+    CARGO_PROFILE="debug"
+  else
+    CARGO_PROFILE="release"
+  fi
+else
+  XCODE_CONFIGURATION="manual"
+  CARGO_PROFILE="debug"
+fi
+
+if [[ "${CARGO_PROFILE}" == "release" ]]; then
+  CARGO_PROFILE_FLAG="--release"
+else
+  CARGO_PROFILE_FLAG=""
+fi
+
+echo "Xcode configuration: ${XCODE_CONFIGURATION}"
+echo "Rust cargo profile: ${CARGO_PROFILE}"
+
 RUSTUP="$(command -v rustup || true)"
 
 if [[ -z "${RUSTUP}" ]]; then
@@ -140,19 +177,19 @@ for target in "${IOS_TARGETS[@]}"; do
     continue
   fi
 
-  TARGET_LIB_PATH="${RUST_CORE_DIR}/target/${target}/release/libdcss_core.a"
+  TARGET_LIB_PATH="${RUST_CORE_DIR}/target/${target}/${CARGO_PROFILE}/libdcss_core.a"
   TARGET_STAMP_PATH="${BUILD_STAMP_DIR}/${target}.sha"
   CURRENT_HASH="$(compute_inputs_hash "${target}")"
   PREV_HASH="$( [[ -f "${TARGET_STAMP_PATH}" ]] && cat "${TARGET_STAMP_PATH}" || true )"
 
   if [[ -f "${TARGET_LIB_PATH}" && "${CURRENT_HASH}" == "${PREV_HASH}" ]]; then
-    echo "==> skip cargo build --release --target ${target} (no RustCore changes)"
+    echo "==> skip cargo build ${CARGO_PROFILE_FLAG} --target ${target} (no RustCore changes)"
     BUILT_TARGETS="${BUILT_TARGETS} ${target}"
     continue
   fi
 
-  echo "==> cargo build --release --target ${target} (inputs changed)"
-  "${TOOLCHAIN_CARGO}" build --release --target "${target}" || {
+  echo "==> cargo build ${CARGO_PROFILE_FLAG} --target ${target} (inputs changed)"
+  "${TOOLCHAIN_CARGO}" build ${CARGO_PROFILE_FLAG} --target "${target}" || {
     echo "warning: build failed for target ${target}; skipping it" >&2
     continue
   }
@@ -165,7 +202,7 @@ mkdir -p "${OUT_DIR}"
 
 LIBS=()
 for target in ${BUILT_TARGETS}; do
-  LIB_PATH="${RUST_CORE_DIR}/target/${target}/release/libdcss_core.a"
+  LIB_PATH="${RUST_CORE_DIR}/target/${target}/${CARGO_PROFILE}/libdcss_core.a"
   if [[ -f "${LIB_PATH}" ]]; then
     LIBS+=("${LIB_PATH}")
   fi
@@ -178,9 +215,9 @@ if [[ ${#LIBS[@]} -eq 0 ]]; then
 fi
 
 # Device + simulator outputs:
-DEVICE_LIB="${RUST_CORE_DIR}/target/aarch64-apple-ios/release/libdcss_core.a"
-SIM_ARM64_LIB="${RUST_CORE_DIR}/target/aarch64-apple-ios-sim/release/libdcss_core.a"
-SIM_X64_LIB="${RUST_CORE_DIR}/target/x86_64-apple-ios/release/libdcss_core.a"
+DEVICE_LIB="${RUST_CORE_DIR}/target/aarch64-apple-ios/${CARGO_PROFILE}/libdcss_core.a"
+SIM_ARM64_LIB="${RUST_CORE_DIR}/target/aarch64-apple-ios-sim/${CARGO_PROFILE}/libdcss_core.a"
+SIM_X64_LIB="${RUST_CORE_DIR}/target/x86_64-apple-ios/${CARGO_PROFILE}/libdcss_core.a"
 SIM_UNIVERSAL_LIB="${OUT_DIR}/libdcss_core_iossim_universal.a"
 
 if [[ -f "${DEVICE_LIB}" ]]; then
