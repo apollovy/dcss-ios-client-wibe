@@ -54,6 +54,11 @@ unset CARGO_BUILD_RUSTC || true
 unset CARGO_BUILD_RUSTC_WRAPPER || true
 unset RUSTC_WRAPPER || true
 export RUSTC="${TOOLCHAIN_RUSTC}"
+unset RUSTFLAGS || true
+unset CFLAGS || true
+unset CXXFLAGS || true
+unset CPPFLAGS || true
+unset LDFLAGS || true
 
 # Targets for device + simulator:
 # - aarch64-apple-ios: real iPhone
@@ -66,6 +71,45 @@ IOS_TARGETS=(
 )
 
 BUILT_TARGETS=""
+
+BUILD_STAMP_DIR="${CARGO_TARGET_DIR}/.build-stamps"
+mkdir -p "${BUILD_STAMP_DIR}"
+
+compute_inputs_hash() {
+  local target="$1"
+  local hash_input=""
+
+  hash_input+="toolchain:${TOOLCHAIN}"$'\n'
+  hash_input+="target:${target}"$'\n'
+  hash_input+="rustc:$("${TOOLCHAIN_RUSTC}" --version)"$'\n'
+  hash_input+="cargo:$("${TOOLCHAIN_CARGO}" --version)"$'\n'
+
+  local files=()
+  if [[ -f "${RUST_CORE_DIR}/Cargo.toml" ]]; then
+    files+=("${RUST_CORE_DIR}/Cargo.toml")
+  fi
+  if [[ -f "${RUST_CORE_DIR}/Cargo.lock" ]]; then
+    files+=("${RUST_CORE_DIR}/Cargo.lock")
+  fi
+  if [[ -f "${RUST_CORE_DIR}/rust-toolchain.toml" ]]; then
+    files+=("${RUST_CORE_DIR}/rust-toolchain.toml")
+  fi
+  if [[ -f "${RUST_CORE_DIR}/rust-toolchain" ]]; then
+    files+=("${RUST_CORE_DIR}/rust-toolchain")
+  fi
+
+  while IFS= read -r -d '' file; do
+    files+=("${file}")
+  done < <(find "${RUST_CORE_DIR}/src" -type f -name "*.rs" -print0 | sort -z)
+
+  for file in "${files[@]}"; do
+    hash_input+="$("${TOOLCHAIN_CARGO}" -Vv 2>/dev/null | head -n 1):${file}:$(
+      shasum "${file}" | awk '{print $1}'
+    )"$'\n'
+  done
+
+  printf "%s" "${hash_input}" | shasum | awk '{print $1}'
+}
 
 ensure_target_for_toolchain() {
   local target="$1"
@@ -96,11 +140,23 @@ for target in "${IOS_TARGETS[@]}"; do
     continue
   fi
 
-  echo "==> cargo build --release --target ${target}"
+  TARGET_LIB_PATH="${RUST_CORE_DIR}/target/${target}/release/libdcss_core.a"
+  TARGET_STAMP_PATH="${BUILD_STAMP_DIR}/${target}.sha"
+  CURRENT_HASH="$(compute_inputs_hash "${target}")"
+  PREV_HASH="$( [[ -f "${TARGET_STAMP_PATH}" ]] && cat "${TARGET_STAMP_PATH}" || true )"
+
+  if [[ -f "${TARGET_LIB_PATH}" && "${CURRENT_HASH}" == "${PREV_HASH}" ]]; then
+    echo "==> skip cargo build --release --target ${target} (no RustCore changes)"
+    BUILT_TARGETS="${BUILT_TARGETS} ${target}"
+    continue
+  fi
+
+  echo "==> cargo build --release --target ${target} (inputs changed)"
   "${TOOLCHAIN_CARGO}" build --release --target "${target}" || {
     echo "warning: build failed for target ${target}; skipping it" >&2
     continue
   }
+  printf "%s" "${CURRENT_HASH}" > "${TARGET_STAMP_PATH}"
   BUILT_TARGETS="${BUILT_TARGETS} ${target}"
 done
 
@@ -128,27 +184,34 @@ SIM_X64_LIB="${RUST_CORE_DIR}/target/x86_64-apple-ios/release/libdcss_core.a"
 SIM_UNIVERSAL_LIB="${OUT_DIR}/libdcss_core_iossim_universal.a"
 
 if [[ -f "${DEVICE_LIB}" ]]; then
-  cp -f "${DEVICE_LIB}" "${OUT_DIR}/libdcss_core_ios_device.a"
+  if [[ ! -f "${OUT_DIR}/libdcss_core_ios_device.a" ]] || ! cmp -s "${DEVICE_LIB}" "${OUT_DIR}/libdcss_core_ios_device.a"; then
+    cp -f "${DEVICE_LIB}" "${OUT_DIR}/libdcss_core_ios_device.a"
+  fi
   echo "Device static lib: ${OUT_DIR}/libdcss_core_ios_device.a"
 fi
 
 if [[ -f "${SIM_ARM64_LIB}" && -f "${SIM_X64_LIB}" && $(command -v lipo >/dev/null 2>&1; echo $?) -eq 0 ]]; then
-  echo "==> Creating simulator universal static library with lipo"
-  lipo -create "${SIM_ARM64_LIB}" "${SIM_X64_LIB}" -output "${SIM_UNIVERSAL_LIB}"
+  if [[ ! -f "${SIM_UNIVERSAL_LIB}" || "${SIM_ARM64_LIB}" -nt "${SIM_UNIVERSAL_LIB}" || "${SIM_X64_LIB}" -nt "${SIM_UNIVERSAL_LIB}" ]]; then
+    echo "==> Creating simulator universal static library with lipo"
+    lipo -create "${SIM_ARM64_LIB}" "${SIM_X64_LIB}" -output "${SIM_UNIVERSAL_LIB}"
+  else
+    echo "==> skip lipo (simulator universal lib up-to-date)"
+  fi
   echo "Simulator universal lib: ${SIM_UNIVERSAL_LIB}"
 elif [[ -f "${SIM_ARM64_LIB}" ]]; then
-  cp -f "${SIM_ARM64_LIB}" "${SIM_UNIVERSAL_LIB}"
+  if [[ ! -f "${SIM_UNIVERSAL_LIB}" ]] || ! cmp -s "${SIM_ARM64_LIB}" "${SIM_UNIVERSAL_LIB}"; then
+    cp -f "${SIM_ARM64_LIB}" "${SIM_UNIVERSAL_LIB}"
+  fi
   echo "Simulator static lib (arm64 only): ${SIM_UNIVERSAL_LIB}"
 elif [[ -f "${SIM_X64_LIB}" ]]; then
-  cp -f "${SIM_X64_LIB}" "${SIM_UNIVERSAL_LIB}"
+  if [[ ! -f "${SIM_UNIVERSAL_LIB}" ]] || ! cmp -s "${SIM_X64_LIB}" "${SIM_UNIVERSAL_LIB}"; then
+    cp -f "${SIM_X64_LIB}" "${SIM_UNIVERSAL_LIB}"
+  fi
   echo "Simulator static lib (x86_64 only): ${SIM_UNIVERSAL_LIB}"
 fi
 
 # Optional: build an xcframework to consume from Xcode
 if command -v xcodebuild >/dev/null 2>&1; then
-  echo "==> Creating DCSSCore.xcframework"
-  rm -rf "${OUT_DIR}/DCSSCore.xcframework"
-
   XC_ARGS=()
   if [[ -f "${OUT_DIR}/libdcss_core_ios_device.a" ]]; then
     XC_ARGS+=(-library "${OUT_DIR}/libdcss_core_ios_device.a" -headers "${RUST_CORE_DIR}")
@@ -164,14 +227,33 @@ if command -v xcodebuild >/dev/null 2>&1; then
     exit 0
   fi
 
-  set +e
-  xcodebuild -create-xcframework "${XC_ARGS[@]}" -output "${OUT_DIR}/DCSSCore.xcframework"
-  XC_EXIT=$?
-  set -e
-  if [[ ${XC_EXIT} -eq 0 ]]; then
-    echo "XCFramework: ${OUT_DIR}/DCSSCore.xcframework"
+  XCFRAMEWORK_PLIST="${OUT_DIR}/DCSSCore.xcframework/Info.plist"
+  NEED_XCFRAMEWORK_BUILD=1
+  if [[ -f "${XCFRAMEWORK_PLIST}" ]]; then
+    NEED_XCFRAMEWORK_BUILD=0
+    if [[ -f "${OUT_DIR}/libdcss_core_ios_device.a" && "${OUT_DIR}/libdcss_core_ios_device.a" -nt "${XCFRAMEWORK_PLIST}" ]]; then
+      NEED_XCFRAMEWORK_BUILD=1
+    fi
+    if [[ -f "${SIM_UNIVERSAL_LIB}" && "${SIM_UNIVERSAL_LIB}" -nt "${XCFRAMEWORK_PLIST}" ]]; then
+      NEED_XCFRAMEWORK_BUILD=1
+    fi
+  fi
+
+  if [[ ${NEED_XCFRAMEWORK_BUILD} -eq 0 ]]; then
+    echo "==> skip XCFramework rebuild (artifacts unchanged)"
   else
-    echo "warning: failed to create XCFramework; static .a is still available" >&2
+    echo "==> Creating DCSSCore.xcframework"
+    rm -rf "${OUT_DIR}/DCSSCore.xcframework"
+
+    set +e
+    xcodebuild -create-xcframework "${XC_ARGS[@]}" -output "${OUT_DIR}/DCSSCore.xcframework"
+    XC_EXIT=$?
+    set -e
+    if [[ ${XC_EXIT} -eq 0 ]]; then
+      echo "XCFramework: ${OUT_DIR}/DCSSCore.xcframework"
+    else
+      echo "warning: failed to create XCFramework; static .a is still available" >&2
+    fi
   fi
 fi
 
