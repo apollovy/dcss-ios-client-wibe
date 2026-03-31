@@ -118,7 +118,7 @@ fn decode_server_events(data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCod
     for item in stream {
         let value = item
             .map_err(|e| ProtocolCodecError::MalformedPayload(format!("invalid json stream: {e}")))?;
-        events.push(decode_server_value(value)?);
+        events.extend(decode_server_value_as_events(value)?);
     }
     if events.is_empty() {
         return Err(ProtocolCodecError::MalformedPayload(
@@ -157,6 +157,77 @@ fn decode_server_value(value: Value) -> Result<DCSSServerEvent, ProtocolCodecErr
     decode_by_type(type_name, &payload)
 }
 
+fn decode_server_value_as_events(value: Value) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+    if let Some(obj) = value.as_object() {
+        if let Some(msgs) = obj.get("msgs").and_then(|v| v.as_array()) {
+            let mut events = Vec::new();
+            for item in msgs {
+                if let Some(item_obj) = item.as_object() {
+                    let payload: HashMap<String, Value> = item_obj.clone().into_iter().collect();
+                    let msg_type = item_obj
+                        .get("msg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    // DCSS web client uses { msgs: [{ msg: "...", ... }, ...] } envelope.
+                    let ev = match msg_type {
+                        "ping" => DCSSServerEvent::HeartbeatRequest,
+                        "chat" | "message" => {
+                            let text = payload
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| payload.get("message").and_then(|v| v.as_str()))
+                                .unwrap_or("")
+                                .to_string();
+                            DCSSServerEvent::Message { text }
+                        }
+                        other => DCSSServerEvent::Unknown {
+                            type_name: other.to_string(),
+                        },
+                    };
+                    println!("[RustCore] decoded msg type={msg_type}");
+                    events.push(ev);
+                }
+            }
+            if !events.is_empty() {
+                return Ok(events);
+            }
+        }
+    }
+    if let Some(items) = value.as_array() {
+        let mut events = Vec::new();
+        for item in items {
+            if let Some(item_obj) = item.as_object() {
+                let payload: HashMap<String, Value> = item_obj.clone().into_iter().collect();
+                let msg_type = item_obj
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let ev = match msg_type {
+                    "ping" => DCSSServerEvent::HeartbeatRequest,
+                    "chat" | "message" => {
+                        let text = payload
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| payload.get("message").and_then(|v| v.as_str()))
+                            .unwrap_or("")
+                            .to_string();
+                        DCSSServerEvent::Message { text }
+                    }
+                    other => DCSSServerEvent::Unknown {
+                        type_name: other.to_string(),
+                    },
+                };
+                println!("[RustCore] decoded msg type={msg_type}");
+                events.push(ev);
+            }
+        }
+        if !events.is_empty() {
+            return Ok(events);
+        }
+    }
+    Ok(vec![decode_server_value(value)?])
+}
+
 fn decode_server_event_binary(data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
     // 1) Try as plain UTF-8 JSON first.
     if let Ok(events) = decode_server_events(data) {
@@ -184,8 +255,22 @@ fn decode_server_event_binary(data: &[u8]) -> Result<Vec<DCSSServerEvent>, Proto
     ))
 }
 
+fn is_ignorable_decode_error(err: &ProtocolCodecError) -> bool {
+    match err {
+        ProtocolCodecError::InvalidUtf8 => true,
+        ProtocolCodecError::MalformedPayload(msg) => {
+            msg.contains("expected value")
+                || msg.contains("EOF while parsing")
+                || msg.contains("trailing characters")
+                || msg.contains("json stream produced no events")
+                || msg.contains("json stream produced no complete events yet")
+        }
+    }
+}
+
 struct StatefulBinaryInflater {
     raw: Decompress,
+    pending_json: Vec<u8>,
 }
 
 impl StatefulBinaryInflater {
@@ -193,10 +278,11 @@ impl StatefulBinaryInflater {
         // false => raw DEFLATE stream (no zlib/gzip header), matches permessage-deflate payloads.
         Self {
             raw: Decompress::new(false),
+            pending_json: Vec::new(),
         }
     }
 
-    fn decode_json_bytes(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+    fn inflate_bytes(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
         // RFC7692/permessage-deflate messages are usually terminated with Z_SYNC_FLUSH marker.
         // To inflate each WS frame while keeping context takeover, append trailer then keep inflater state.
         let mut input = Vec::with_capacity(data.len() + 4);
@@ -208,6 +294,68 @@ impl StatefulBinaryInflater {
             .decompress_vec(&input, &mut out, FlushDecompress::Sync)
             .map_err(|e| format!("stateful raw inflate failed: {e}"))?;
         Ok(out)
+    }
+
+    fn decode_events(&mut self, data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+        let inflated = self
+            .inflate_bytes(data)
+            .map_err(ProtocolCodecError::MalformedPayload)?;
+        println!(
+            "[RustCore] binary payload decoded via stateful deflate len={}",
+            inflated.len()
+        );
+        if let Ok(text) = std::str::from_utf8(&inflated) {
+            println!("[RustCore] inflated text preview={text}");
+        } else {
+            println!("[RustCore] inflated bytes are not valid UTF-8");
+        }
+        self.pending_json.extend_from_slice(&inflated);
+
+        let mut parsed_values: Vec<Value> = Vec::new();
+        let mut consumed: usize = 0;
+        let mut eof_in_tail = false;
+
+        let mut iter = Deserializer::from_slice(&self.pending_json).into_iter::<Value>();
+        loop {
+            match iter.next() {
+                Some(Ok(value)) => {
+                    parsed_values.push(value);
+                    consumed = iter.byte_offset();
+                }
+                Some(Err(err)) => {
+                    consumed = iter.byte_offset();
+                    if err.is_eof() {
+                        eof_in_tail = true;
+                    } else {
+                        return Err(ProtocolCodecError::MalformedPayload(format!(
+                            "invalid json stream: {err}"
+                        )));
+                    }
+                    break;
+                }
+                None => {
+                    consumed = iter.byte_offset();
+                    break;
+                }
+            }
+        }
+
+        if consumed > 0 {
+            self.pending_json.drain(..consumed);
+        }
+
+        let mut events = Vec::new();
+        for value in parsed_values {
+            events.extend(decode_server_value_as_events(value)?);
+        }
+
+        if events.is_empty() && eof_in_tail {
+            return Err(ProtocolCodecError::MalformedPayload(
+                "json stream produced no complete events yet".to_string(),
+            ));
+        }
+
+        Ok(events)
     }
 }
 
@@ -654,7 +802,7 @@ async fn run_event_loop(
                                             }
                                             Err(e) => {
                                                 let msg = format!("decode text failed: {:?}", e);
-                                                {
+                                                if !is_ignorable_decode_error(&e) {
                                                     let mut s = state.lock().unwrap();
                                                     s.diagnostics.last_error = Some(msg.clone());
                                                 }
@@ -666,16 +814,10 @@ async fn run_event_loop(
                                     }
                                     Ok(WsMessage::Binary(bin)) => {
                                         println!("[RustCore] recv binary len={}", bin.len());
-                                        let event = match binary_inflater.decode_json_bytes(&bin) {
-                                            Ok(inflated) => {
-                                                println!(
-                                                    "[RustCore] binary payload decoded via stateful deflate len={}",
-                                                    inflated.len()
-                                                );
-                                                decode_server_events(&inflated)
-                                            }
+                                        let event = match binary_inflater.decode_events(&bin) {
+                                            Ok(decoded) => Ok(decoded),
                                             Err(err) => {
-                                                println!("[RustCore] stateful inflater miss: {err}");
+                                                println!("[RustCore] stateful inflater miss: {:?}", err);
                                                 decode_server_event_binary(&bin)
                                             }
                                         };
@@ -693,7 +835,7 @@ async fn run_event_loop(
                                                     .collect::<Vec<_>>()
                                                     .join(" ");
                                                 let msg = format!("decode binary failed: {:?}", e);
-                                                {
+                                                if !is_ignorable_decode_error(&e) {
                                                     let mut s = state.lock().unwrap();
                                                     s.diagnostics.last_error = Some(msg.clone());
                                                 }
