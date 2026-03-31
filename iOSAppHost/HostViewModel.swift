@@ -7,10 +7,12 @@ import Observation
 @Observable
 final class HostViewModel {
     var serverURL = "wss://example.com/socket"
+    private(set) var connectionState: DCSSConnectionState = .idle
     var connectionStatus = "idle"
     var grid: [String] = []
     var statusLine = ""
     var lastMessage = ""
+    var msgsJsonLog: [String] = []
     var commandInput = ""
 
     var debugLastEvent = "-"
@@ -70,12 +72,27 @@ final class HostViewModel {
 
     func refresh() async {
         let snapshot = await session.stateSnapshot()
+        connectionState = snapshot.0
         connectionStatus = String(describing: snapshot.0)
         grid = snapshot.1.grid
         statusLine = snapshot.1.statusLine
         lastMessage = snapshot.1.lastMessage
+        msgsJsonLog = snapshot.1.msgsJsonLog
         debugLastEvent = snapshot.2.lastEventType ?? "-"
         debugReconnectAttempt = snapshot.2.reconnectAttempt.map(String.init) ?? "-"
         debugLastError = snapshot.2.lastError ?? "-"
+    }
+
+    func runSnapshotPollLoop() async {
+        while !Task.isCancelled {
+            await refresh()
+            let nanos: UInt64 = switch connectionState {
+            case .connected, .connecting, .reconnecting:
+                250_000_000
+            case .idle, .failed:
+                1_000_000_000
+            }
+            try? await Task.sleep(nanoseconds: nanos)
+        }
     }
 }

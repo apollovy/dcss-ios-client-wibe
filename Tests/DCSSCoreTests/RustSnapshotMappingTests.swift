@@ -10,7 +10,8 @@ final class RustSnapshotMappingTests: XCTestCase {
           "gameState": {
             "grid": ["##########", "#..@.....#", "##########"],
             "statusLine": "HP 24/24 MP 3/3",
-            "lastMessage": "You feel healthy."
+            "lastMessage": "You feel healthy.",
+            "msgsJsonLog": []
           },
           "diagnostics": {
             "lastEventType": "frame",
@@ -27,6 +28,7 @@ final class RustSnapshotMappingTests: XCTestCase {
         XCTAssertEqual(game.grid, ["##########", "#..@.....#", "##########"])
         XCTAssertEqual(game.statusLine, "HP 24/24 MP 3/3")
         XCTAssertEqual(game.lastMessage, "You feel healthy.")
+        XCTAssertEqual(game.msgsJsonLog, [])
 
         XCTAssertEqual(diagnostics.lastEventType, "frame")
         XCTAssertNil(diagnostics.reconnectAttempt)

@@ -7,6 +7,8 @@ import Observation
 @Observable
 final class GameViewModel {
     var serverURL = "wss://example.com/socket"
+    /// Текущее состояние сессии (для опроса снимка из Rust).
+    private(set) var connectionState: DCSSConnectionState = .idle
     var connectionStatus = "idle"
     var grid: [String] = []
     var statusLine = ""
@@ -18,6 +20,8 @@ final class GameViewModel {
     var debugReconnectAttempt = "-"
     var debugLastError = "-"
     var debugLastConnectedAt = "-"
+    /// One JSON object per line from `msgs` envelopes (Rust core).
+    var msgsJsonLog: [String] = []
 
     private let settings: SettingsStore
     private nonisolated let session: any SessionClient
@@ -78,12 +82,14 @@ final class GameViewModel {
 
     func syncFromSession() async {
         let snapshot = await session.stateSnapshot()
+        connectionState = snapshot.0
         connectionStatus = String(describing: snapshot.0)
 
         let game = snapshot.1
         grid = game.grid
         statusLine = game.statusLine
         lastMessage = game.lastMessage
+        msgsJsonLog = game.msgsJsonLog
 
         let diagnostics = snapshot.2
         debugLastEvent = diagnostics.lastEventType ?? "-"
@@ -94,6 +100,20 @@ final class GameViewModel {
             debugLastConnectedAt = formatter.string(from: date)
         } else {
             debugLastConnectedAt = "-"
+        }
+    }
+
+    /// Rust обновляет состояние в фоне; без периодического снимка UI не видит новые `msgs` / grid.
+    func runSnapshotPollLoop() async {
+        while !Task.isCancelled {
+            await syncFromSession()
+            let nanos: UInt64 = switch connectionState {
+            case .connected, .connecting, .reconnecting:
+                250_000_000 // 250 ms
+            case .idle, .failed:
+                1_000_000_000 // 1 s
+            }
+            try? await Task.sleep(nanoseconds: nanos)
         }
     }
 }

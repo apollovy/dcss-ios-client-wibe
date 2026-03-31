@@ -147,22 +147,40 @@ fn decode_server_event(data: &[u8]) -> Result<DCSSServerEvent, ProtocolCodecErro
     decode_server_value(value)
 }
 
-fn decode_server_events(data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+const MSGS_JSON_LOG_CAP: usize = 400;
+
+fn append_msgs_json_log(into: &mut Vec<String>, lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
+    }
+    into.extend(lines);
+    if into.len() > MSGS_JSON_LOG_CAP {
+        let drain = into.len() - MSGS_JSON_LOG_CAP;
+        into.drain(0..drain);
+    }
+}
+
+fn decode_server_events(
+    data: &[u8],
+) -> Result<(Vec<DCSSServerEvent>, Vec<String>), ProtocolCodecError> {
     ensure_rust_core_log();
     let s = std::str::from_utf8(data).map_err(|_| ProtocolCodecError::InvalidUtf8)?;
     let mut events = Vec::new();
+    let mut msgs_json_lines = Vec::new();
     let stream = Deserializer::from_str(s).into_iter::<Value>();
     for item in stream {
         let value = item
             .map_err(|e| ProtocolCodecError::MalformedPayload(format!("invalid json stream: {e}")))?;
-        events.extend(decode_server_value_as_events(value)?);
+        let (evs, lines) = decode_server_value_as_events(value)?;
+        events.extend(evs);
+        append_msgs_json_log(&mut msgs_json_lines, lines);
     }
     if events.is_empty() {
         return Err(ProtocolCodecError::MalformedPayload(
             "json stream produced no events".to_string(),
         ));
     }
-    Ok(events)
+    Ok((events, msgs_json_lines))
 }
 
 fn decode_server_value(value: Value) -> Result<DCSSServerEvent, ProtocolCodecError> {
@@ -194,9 +212,15 @@ fn decode_server_value(value: Value) -> Result<DCSSServerEvent, ProtocolCodecErr
     decode_by_type(type_name, &payload)
 }
 
-fn decode_server_value_as_events(value: Value) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+fn decode_server_value_as_events(
+    value: Value,
+) -> Result<(Vec<DCSSServerEvent>, Vec<String>), ProtocolCodecError> {
     if let Some(obj) = value.as_object() {
         if let Some(msgs) = obj.get("msgs").and_then(|v| v.as_array()) {
+            let json_lines: Vec<String> = msgs
+                .iter()
+                .map(|item| serde_json::to_string(item).unwrap_or_else(|_| "null".to_string()))
+                .collect();
             let mut events = Vec::new();
             for item in msgs {
                 if let Some(item_obj) = item.as_object() {
@@ -226,11 +250,15 @@ fn decode_server_value_as_events(value: Value) -> Result<Vec<DCSSServerEvent>, P
                 }
             }
             if !events.is_empty() {
-                return Ok(events);
+                return Ok((events, json_lines));
             }
         }
     }
     if let Some(items) = value.as_array() {
+        let json_lines: Vec<String> = items
+            .iter()
+            .map(|item| serde_json::to_string(item).unwrap_or_else(|_| "null".to_string()))
+            .collect();
         let mut events = Vec::new();
         for item in items {
             if let Some(item_obj) = item.as_object() {
@@ -259,41 +287,43 @@ fn decode_server_value_as_events(value: Value) -> Result<Vec<DCSSServerEvent>, P
             }
         }
         if !events.is_empty() {
-            return Ok(events);
+            return Ok((events, json_lines));
         }
     }
-    Ok(vec![decode_server_value(value)?])
+    Ok((vec![decode_server_value(value)?], vec![]))
 }
 
-fn decode_server_event_binary(data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+fn decode_server_event_binary(
+    data: &[u8],
+) -> Result<(Vec<DCSSServerEvent>, Vec<String>), ProtocolCodecError> {
     // 1) Try as plain UTF-8 JSON first.
-    if let Ok(events) = decode_server_events(data) {
+    if let Ok(parsed) = decode_server_events(data) {
         if let Ok(text) = std::str::from_utf8(data) {
             log::debug!("[RustCore] binary payload decoded as plain utf8 len={}", data.len());
             log::debug!("[RustCore] inflated text preview={text}");
         }
-        return Ok(events);
+        return Ok(parsed);
     }
 
     // 2) Try zlib-wrapped DEFLATE (common pako/default case).
     if let Ok(inflated) = decompress_to_vec_zlib(data) {
-        if let Ok(events) = decode_server_events(&inflated) {
+        if let Ok(parsed) = decode_server_events(&inflated) {
             log::debug!("[RustCore] binary payload decoded via zlib inflate len={}", inflated.len());
             if let Ok(text) = std::str::from_utf8(&inflated) {
                 log::debug!("[RustCore] inflated text preview={text}");
             }
-            return Ok(events);
+            return Ok(parsed);
         }
     }
 
     // 3) Try raw DEFLATE (pako inflateRaw case).
     if let Ok(inflated) = decompress_to_vec(data) {
-        if let Ok(events) = decode_server_events(&inflated) {
+        if let Ok(parsed) = decode_server_events(&inflated) {
             log::debug!("[RustCore] binary payload decoded via raw deflate len={}", inflated.len());
             if let Ok(text) = std::str::from_utf8(&inflated) {
                 log::debug!("[RustCore] inflated text preview={text}");
             }
-            return Ok(events);
+            return Ok(parsed);
         }
     }
 
@@ -327,7 +357,10 @@ impl StatefulBinaryInflater {
         }
     }
 
-    fn decode_events(&mut self, data: &[u8]) -> Result<Vec<DCSSServerEvent>, ProtocolCodecError> {
+    fn decode_events(
+        &mut self,
+        data: &[u8],
+    ) -> Result<(Vec<DCSSServerEvent>, Vec<String>), ProtocolCodecError> {
         ensure_rust_core_log();
         // Per-frame inflate: each websocket binary message is expected to contain one full JSON payload.
         let mut input = Vec::with_capacity(data.len() + 4);
@@ -376,11 +409,14 @@ impl StatefulBinaryInflater {
         }
 
         let mut events = Vec::new();
+        let mut msgs_json_lines = Vec::new();
         for value in Deserializer::from_slice(&inflated).into_iter::<Value>() {
             let value = value.map_err(|e| ProtocolCodecError::MalformedPayload(format!("invalid json stream: {e}")))?;
-            events.extend(decode_server_value_as_events(value)?);
+            let (evs, lines) = decode_server_value_as_events(value)?;
+            events.extend(evs);
+            append_msgs_json_log(&mut msgs_json_lines, lines);
         }
-        Ok(events)
+        Ok((events, msgs_json_lines))
     }
 }
 
@@ -483,6 +519,8 @@ struct GameStateRepr {
     grid: Vec<String>,
     statusLine: String,
     lastMessage: String,
+    #[serde(default)]
+    msgsJsonLog: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,6 +543,7 @@ struct GameStateInternal {
     grid: Vec<String>,
     status_line: String,
     last_message: String,
+    msgs_json_log: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -557,6 +596,7 @@ impl Session {
                 grid: vec![],
                 status_line: "".to_string(),
                 last_message: "".to_string(),
+                msgs_json_log: vec![],
             },
             diagnostics: DiagnosticsInternal {
                 last_event_type: None,
@@ -623,6 +663,7 @@ impl Session {
             grid: state.game_state.grid.clone(),
             statusLine: state.game_state.status_line.clone(),
             lastMessage: state.game_state.last_message.clone(),
+            msgsJsonLog: state.game_state.msgs_json_log.clone(),
         };
 
         let snapshot = SnapshotRepr {
@@ -820,7 +861,11 @@ async fn run_event_loop(
                                         );
                                         let events = decode_server_events(txt.as_bytes());
                                         match events {
-                                            Ok(decoded) => {
+                                            Ok((decoded, msgs_lines)) => {
+                                                if !msgs_lines.is_empty() {
+                                                    let mut s = state.lock().unwrap();
+                                                    append_msgs_json_log(&mut s.game_state.msgs_json_log, msgs_lines);
+                                                }
                                                 for ev in decoded {
                                                     apply_event(&state, &mut ws_stream, ev).await;
                                                 }
@@ -840,14 +885,18 @@ async fn run_event_loop(
                                     Ok(WsMessage::Binary(bin)) => {
                                         log::debug!("[RustCore] recv binary len={}", bin.len());
                                         let event = match binary_inflater.decode_events(&bin) {
-                                            Ok(decoded) => Ok(decoded),
+                                            Ok(parsed) => Ok(parsed),
                                             Err(err) => {
                                                 log::debug!("[RustCore] stateful inflater miss: {:?}", err);
                                                 Err(err)
                                             }
                                         };
                                         match event {
-                                            Ok(decoded) => {
+                                            Ok((decoded, msgs_lines)) => {
+                                                if !msgs_lines.is_empty() {
+                                                    let mut s = state.lock().unwrap();
+                                                    append_msgs_json_log(&mut s.game_state.msgs_json_log, msgs_lines);
+                                                }
                                                 for ev in decoded {
                                                     apply_event(&state, &mut ws_stream, ev).await;
                                                 }
@@ -1210,8 +1259,11 @@ mod tests {
     #[test]
     fn decode_msgs_envelope_payload() {
         let payload = br#"{"msgs":[{"msg":"ping"},{"msg":"lobby_entry","username":"Broken26"}]}"#;
-        let events = decode_server_events(payload).expect("decode msgs envelope");
+        let (events, msgs_lines) = decode_server_events(payload).expect("decode msgs envelope");
         assert_eq!(events.len(), 2);
+        assert_eq!(msgs_lines.len(), 2);
+        assert_eq!(msgs_lines[0], r#"{"msg":"ping"}"#);
+        assert!(msgs_lines[1].contains("lobby_entry"));
         match &events[0] {
             DCSSServerEvent::HeartbeatRequest => {}
             _ => panic!("expected heartbeat request"),
@@ -1271,7 +1323,7 @@ mod tests {
                 match next_msg {
                     Some(Ok(WsMessage::Text(t))) => {
                         log::debug!("[live-test] text frame len={}", t.len());
-                        if let Ok(events) = decode_server_events(t.as_bytes()) {
+                        if let Ok((events, _)) = decode_server_events(t.as_bytes()) {
                             for ev in events {
                                 log::debug!("[live-test] decoded text event: {:?}", ev);
                             }
@@ -1282,7 +1334,7 @@ mod tests {
                     }
                     Some(Ok(WsMessage::Binary(b))) => {
                         log::debug!("[live-test] binary frame len={}", b.len());
-                        if let Ok(events) = inflator.decode_events(&b) {
+                        if let Ok((events, _)) = inflator.decode_events(&b) {
                             for ev in events {
                                 log::debug!("[live-test] decoded binary event: {:?}", ev);
                             }

@@ -40,6 +40,16 @@ struct HostContentView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Text(vm.statusLine).font(.headline)
 
+                    GroupBox("Msgs (raw JSON)") {
+                        ScrollView {
+                            Text(vm.msgsJsonLog.isEmpty ? "—" : vm.msgsJsonLog.joined(separator: "\n"))
+                                .font(.system(size: 11, design: .monospaced))
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(minHeight: 72, maxHeight: 220)
+                    }
+
                     ScrollView {
                         VStack(alignment: .leading, spacing: 2) {
                             ForEach(vm.grid.indices, id: \.self) { idx in
@@ -73,7 +83,7 @@ struct HostContentView: View {
             }
             .tabItem { Label("Game", systemImage: "gamecontroller") }
         }
-        .task { await vm.refresh() }
+        .task { await vm.runSnapshotPollLoop() }
         .onChange(of: scenePhase) { _, newValue in
             Task {
                 if newValue == .background {

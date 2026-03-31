@@ -16,7 +16,7 @@ struct ContentView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape") }
         }
         .task {
-            await vm.syncFromSession()
+            await vm.runSnapshotPollLoop()
         }
         .onChange(of: scenePhase) { _, newValue in
             Task {
@@ -76,6 +76,16 @@ private struct GameScreenView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text(vm.statusLine)
                     .font(.headline)
+
+                GroupBox("Msgs (raw JSON)") {
+                    ScrollView {
+                        Text(vm.msgsJsonLog.isEmpty ? "—" : vm.msgsJsonLog.joined(separator: "\n"))
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(minHeight: 72, maxHeight: 220)
+                }
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {

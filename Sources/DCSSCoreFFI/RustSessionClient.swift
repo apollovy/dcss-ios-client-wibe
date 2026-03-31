@@ -53,6 +53,7 @@ private struct RustSnapshot: Decodable {
         let grid: [String]
         let statusLine: String
         let lastMessage: String
+        let msgsJsonLog: [String]?
     }
 
     struct DiagnosticsRepr: Decodable {
@@ -111,7 +112,8 @@ public enum RustSnapshotMapper {
             let game = GameState(
                 grid: snap.gameState.grid,
                 statusLine: snap.gameState.statusLine,
-                lastMessage: snap.gameState.lastMessage
+                lastMessage: snap.gameState.lastMessage,
+                msgsJsonLog: snap.gameState.msgsJsonLog ?? []
             )
 
             return (connection, game, diagnostics)
